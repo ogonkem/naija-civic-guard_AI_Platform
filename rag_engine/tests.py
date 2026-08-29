@@ -31,16 +31,52 @@ def _fake_stream_service(mock_get_service):
     return fake
 
 
+class _FakeMcp:
+    """Scripted stand-in for McpToolClient. Records calls, returns
+    (payload, latency_ms, ok, error)."""
+
+    def __init__(self, corpus, fail=()):
+        self.corpus = corpus            # {"Section 45": "text", ...}
+        self.fail = set(fail)           # tool names to return ok=False for
+        self.calls = []
+
+    def _reply(self, name, payload):
+        self.calls.append(name)
+        if name in self.fail:
+            return (None, 3.0, False, f"{name} boom")
+        return (payload, 4.2, True, None)
+
+    def lookup_section(self, number):
+        label = f"Section {number}"
+        chunks = [self.corpus[label]] if label in self.corpus else []
+        return self._reply("lookup_section",
+                           {"section": label, "found": bool(chunks), "chunks": chunks})
+
+    def find_related_sections(self, section_id):
+        num = "".join(ch for ch in str(section_id) if ch.isdigit())
+        own = self.corpus.get(f"Section {num}", "")
+        refs = find_section_references(own, exclude={f"Section {num}"})
+        related = [{"section": r, "text": self.corpus[r]} for r in refs if r in self.corpus]
+        return self._reply("find_related_sections",
+                           {"section": f"Section {num}", "found": bool(own),
+                            "references": refs, "related": related})
+
+    def search_precedent(self, query):
+        return self._reply("search_precedent",
+                           {"implemented": False, "message": "not yet implemented"})
+
+
 class _FakeService:
     """Stand-in for RagService: no LLM, no ChromaDB - just scripted behaviour
     so the LangGraph agent can be exercised deterministically."""
 
-    def __init__(self, corpus, classify="direct_lookup", verify_script=None):
+    def __init__(self, corpus, classify="direct_lookup", verify_script=None, mcp=None):
         # corpus: {section_label: page_content}
         self.corpus = corpus
         self._classify = classify
         # verify_script: list of (adequate, reformulated) returned in order
         self._verify_script = list(verify_script or [(True, None)])
+        self.mcp = mcp
         self.calls = []
 
     def classify_query(self, query):
@@ -105,6 +141,70 @@ class RetrievalAgentTests(SimpleTestCase):
         state = run_agent(build_agent_graph(svc), "What does Section 33 say?")
         self.assertEqual(state["retrieval_calls"], 1)
         self.assertEqual(state["chained_sections"], [])
+
+
+class McpAgentTests(SimpleTestCase):
+    """retrieve/chain nodes going through the MCP client (fake) instead of
+    calling retrieval in-process."""
+
+    CORPUS = {
+        "Section 45": "Nothing in sections 37, 38 of this Constitution shall invalidate any law...",
+        "Section 37": "The privacy of citizens ... is guaranteed.",
+        "Section 38": "Every person is entitled to freedom of thought, conscience and religion.",
+    }
+
+    def test_mcp_tools_are_called_and_logged_with_latency(self):
+        mcp = _FakeMcp(self.CORPUS)
+        svc = _FakeService(self.CORPUS, classify="direct_lookup", mcp=mcp)
+        state = run_agent(build_agent_graph(svc), "What does Section 45 say?")
+
+        names = [c["tool_name"] for c in state["tool_calls"]]
+        self.assertEqual(names[0], "lookup_section")                 # retrieve node
+        self.assertIn("find_related_sections", names)                # chain node
+        for c in state["tool_calls"]:
+            self.assertIn("tool_latency_ms", c)
+            self.assertIsInstance(c["tool_latency_ms"], (int, float))
+            self.assertTrue(c["ok"])
+            self.assertIsNone(c["error"])
+
+        # chaining happened via MCP, not in-process retrieve()
+        self.assertNotIn("retrieve", [c[0] for c in svc.calls])
+        self.assertIn("Section 37", state["chained_sections"])
+        self.assertGreater(state["retrieval_calls"], 1)
+
+    def test_mcp_lookup_failure_falls_back_in_process_and_records_error(self):
+        mcp = _FakeMcp(self.CORPUS, fail={"lookup_section"})
+        svc = _FakeService(self.CORPUS, classify="direct_lookup", mcp=mcp)
+        state = run_agent(build_agent_graph(svc), "What does Section 45 say?")
+
+        lookup = next(c for c in state["tool_calls"] if c["tool_name"] == "lookup_section")
+        self.assertFalse(lookup["ok"])
+        self.assertIn("boom", lookup["error"])
+        self.assertIn("retrieve", [c[0] for c in svc.calls])        # fell back in-process
+
+    def test_interpretive_query_calls_search_precedent_stub(self):
+        mcp = _FakeMcp(self.CORPUS)
+        svc = _FakeService(self.CORPUS, classify="interpretive", mcp=mcp)
+        state = run_agent(build_agent_graph(svc), "Can rights be limited in an emergency?")
+        self.assertIn("search_precedent", [c["tool_name"] for c in state["tool_calls"]])
+
+    def test_real_mcp_client_roundtrip_stub_tool(self):
+        """End-to-end over a real subprocess + reused session (search_precedent
+        needs no ChromaDB)."""
+        from rag_engine.mcp_client import McpToolClient
+        client = McpToolClient()
+        try:
+            if not client.wait_ready(timeout=30):
+                self.skipTest("MCP subprocess did not start")
+            p1, lat1, ok1, _ = client.search_precedent("murder precedent")
+            p2, lat2, ok2, _ = client.search_precedent("again")
+            self.assertTrue(ok1 and ok2)
+            self.assertFalse(p1["implemented"])
+            self.assertIn("not yet implemented", p1["message"])
+            # session reused: second call is not paying a new-connection cost
+            self.assertLess(lat2, 1000)
+        finally:
+            client.close()
 
 
 class ChatViewTestCase(APITestCase):

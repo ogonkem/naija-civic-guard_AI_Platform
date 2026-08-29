@@ -25,11 +25,20 @@ COLUMNS = [
     ("vrfy_ms",      lambda r: _num(r.verify_ms),                         9),
     ("gen_ms",       lambda r: _num(r.generation_time_ms),               10),
     ("total_ms",     lambda r: _num(r.total_time_ms),                    10),
+    ("mcp_tool_calls (name latency_ms ok)", lambda r: _tools(r.tool_calls), 46),
     ("tokens",       lambda r: _int(r.tokens_generated),                  7),
-    ("tok/s",        lambda r: _num(r.tokens_per_second, 1),              7),
     ("error",        lambda r: " ".join((r.error or "").split())[:24],   24),
-    ("query",        lambda r: " ".join(r.query_text.split())[:36],      36),
+    ("query",        lambda r: " ".join(r.query_text.split())[:34],      34),
 ]
+
+
+def _tools(calls):
+    if not calls:
+        return "-"
+    return " | ".join(
+        f"{c['tool_name']} {c['tool_latency_ms']:.1f} {'ok' if c['ok'] else 'ERR'}"
+        for c in calls
+    )
 
 
 def _num(v, ndigits=1):

@@ -109,6 +109,7 @@ class ChatView(APIView):
                         "retrieval_calls": metrics.retrieval_calls,
                         "verify_retry": metrics.verify_retry,
                     },
+                    "mcp_tool_calls": metrics.tool_calls,
                     "tokens_generated": metrics.tokens_generated,
                     "tokens_generated_is_estimate": metrics.tokens_generated_is_estimate,
                     "tokens_per_second": _round(metrics.tokens_per_second),

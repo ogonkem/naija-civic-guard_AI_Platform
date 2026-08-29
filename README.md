@@ -30,9 +30,18 @@ previous return / stream shape.
 | node | what it does |
 |---|---|
 | **classify** | one **cheap/fast** LLM call (`CLASSIFY_LLM_MODEL`, default `allam-2-7b` — *not* the generation model) labels the query `direct_lookup` / `cross_reference` / `interpretive`. Keyword heuristic fallback if the call fails. |
-| **retrieve** | hybrid retrieval — `EnsembleRetriever` over ChromaDB vector search + BM25 (BM25 reconstructed at boot from the Chroma collection). |
-| **chain** | scans the retrieved text with the shared section regex (`rag_engine/sections.py`, same logic `ingest.py` tags with); for each referenced section not already retrieved (cap 2) it fires an extra targeted retrieval and folds the result in. |
+| **retrieve** | `direct_lookup` + a section number → MCP `lookup_section` (direct metadata fetch, no semantic search); `interpretive` → MCP `search_precedent` (stub); otherwise in-process hybrid retrieval (`EnsembleRetriever` over ChromaDB vector + BM25). |
+| **chain** | for each primary section (cap 2) → MCP `find_related_sections`, which runs the shared section regex (`rag_engine/sections.py`) over that section's text and returns the cross-referenced sections. Falls back to in-process regex if the MCP client is down. |
 | **verify** | cheap deterministic self-check (no LLM) — is the retrieved text substantive enough for this question type? If not, **one** retry with a reformulated query (hard cap, no loop). |
+
+**MCP tool server** (`rag_engine/mcp_server.py`, official `mcp` SDK, stdio) exposes
+`lookup_section(number)`, `find_related_sections(section_id)`, and
+`search_precedent(query)` (stub — returns *"not yet implemented — case law
+integration planned"*). It reads ChromaDB directly via the `chromadb` client
+(no embeddings), so it starts fast. `RagService` holds **one** `McpToolClient`
+(`rag_engine/mcp_client.py`) — one subprocess + one session for the process
+lifetime; every tool call reuses the open pipes. If it can't start, the agent
+uses the in-process fallback and requests still work.
 
 * **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`, local CPU, public model (no token).
 * **Generation LLM:** **Groq** `ChatGroq`, model from `GROQ_LLM_MODEL`, `temperature=0`. Ollama available as a commented alternative.
@@ -93,8 +102,10 @@ Columns: `request_id` (UUID, for joining async eval results back later),
 (exact from the provider when available, else a whitespace-split estimate —
 `tokens_generated_is_estimate` flags which), `tokens_per_second`, `error`, plus
 the **retrieval-agent trace**: `classify_label`, `retrieval_calls` (> 1 once the
-chain node fires a follow-up retrieval), `verify_retry`, and per-node latency
-`classify_ms` / `retrieve_ms` / `chain_ms` / `verify_ms`.
+chain node fires a follow-up retrieval), `verify_retry`, per-node latency
+`classify_ms` / `retrieve_ms` / `chain_ms` / `verify_ms`, and **`tool_calls`**
+— a nested JSON list of every MCP tool call the retrieve/chain nodes made
+(`{tool_name, tool_latency_ms, ok, error}`), on the same row.
 
 Inspect it:
 ```

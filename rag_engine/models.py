@@ -95,6 +95,10 @@ class RequestMetric(models.Model):
     chain_ms = models.FloatField(null=True, blank=True)
     verify_ms = models.FloatField(null=True, blank=True)
 
+    # Nested per-MCP-tool-call log on the same row (not a separate table):
+    # [{"tool_name", "tool_latency_ms", "ok", "error"}, ...]
+    tool_calls = models.JSONField(default=list, blank=True)
+
     error = models.TextField(blank=True, default="")
 
     class Meta:

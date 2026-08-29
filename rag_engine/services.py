@@ -23,6 +23,7 @@ from langchain_groq import ChatGroq
 
 from .metrics import RequestMetrics
 from .graph import build_agent_graph, run_agent, CLASSES
+from .mcp_client import get_mcp_client
 
 logger = logging.getLogger(__name__)
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -94,10 +95,28 @@ class RagService:
         Answer:"""
         self.QA_PROMPT = PromptTemplate.from_template(template)
 
-        # 5. Compile the retrieval graph (bound to this service).
+        # 5. Persistent MCP client for the retrieve/chain tools (one subprocess
+        # + one session for the whole process; calls reuse the open pipes).
+        self.mcp = None
+        try:
+            self.mcp = get_mcp_client(env={
+                "CHROMA_DB_PATH": os.path.abspath("chroma_db"),
+                "MCP_LOG_LEVEL": "WARNING",
+            })
+            if not self.mcp.wait_ready(timeout=30):
+                logger.warning("MCP client not ready; graph will use the in-process fallback")
+            else:
+                # First lookup_section pays a one-time ChromaDB init in the
+                # subprocess (~0.3-0.5s); spend it at boot, not on request #1.
+                self.mcp.lookup_section(1)
+        except Exception as exc:  # never block startup on the MCP subprocess
+            logger.warning("MCP client unavailable (%s); using in-process fallback", exc)
+            self.mcp = None
+
+        # 6. Compile the retrieval graph (bound to this service).
         self._graph = build_agent_graph(self)
 
-        # 6. Warm up the embedding model so the first real request doesn't pay
+        # 7. Warm up the embedding model so the first real request doesn't pay
         # the one-time torch / model-load cost.
         try:
             self.embeddings.embed_query("warmup")
@@ -217,6 +236,7 @@ class RagService:
             metrics.retrieve_ms = state.get("retrieve_ms")
             metrics.chain_ms = state.get("chain_ms")
             metrics.verify_ms = state.get("verify_ms")
+            metrics.tool_calls = state.get("tool_calls") or []
             # Keep the Phase 2 field meaningful: retrieval_time_ms == retrieve node.
             metrics.retrieval_time_ms = state.get("retrieve_ms")
         return state
