@@ -122,6 +122,126 @@ server, each with its own `tool_latency_ms`.
 
 ---
 
+## 5a. Watch the retrieval agent's decisions
+
+Every request runs the LangGraph agent `classify → retrieve → chain → verify`.
+The `done` line's `agent` block and `mcp_tool_calls` expose exactly what it did.
+This helper prints just that:
+
+Write a tiny formatter once:
+
+```bash
+cat > /tmp/trace.py <<'PY'
+import sys, json
+d = json.loads(sys.stdin.read())
+print("  agent      :", json.dumps(d["agent"]))
+print("  timings_ms :", json.dumps({k: round(v, 1) for k, v in d["timings_ms"].items() if v is not None}))
+print("  mcp_calls  :", json.dumps([[c["tool_name"], round(c["tool_latency_ms"]), c["ok"]] for c in d["mcp_tool_calls"]]))
+PY
+
+ask () {
+  curl -s -N --max-time 90 -X POST http://localhost:8000/api/chat/ \
+    -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d "{\"query\":\"$1\"}" \
+  | grep '"type": "done"' | python /tmp/trace.py
+}
+```
+
+Now hit it with one query of each shape:
+
+```bash
+echo "-- direct_lookup"
+ask "What does Section 33 say?"
+
+echo "-- cross_reference"
+ask "Which sections of the Constitution relate to fundamental human rights?"
+
+echo "-- interpretive"
+ask "Can fundamental rights be limited during a state of emergency?"
+
+echo "-- chaining (Section 45 references sections 37-41)"
+ask "What does Section 45 say about restrictions on fundamental rights in sections 37 to 41?"
+```
+
+What to look for (values vary a little run to run):
+
+| query | `classify` | tells you |
+|---|---|---|
+| Section 33 | `direct_lookup` | classify LLM tagged a section-specific lookup; retrieve node used **`lookup_section`** (direct metadata fetch, no semantic search) |
+| "which sections relate…" | `cross_reference` | often `retrieval_calls` 5–6 and `verify_retry=True` — the verify heuristic decided the first pass was thin and did its **one** reformulated retry |
+| "can rights be limited…" | `interpretive` | retrieve node also calls **`search_precedent`** (the case-law stub) |
+| Section 45 / sections 37–41 | `direct_lookup` | `retrieval_calls=2`: the chain node saw the cross-reference and called **`find_related_sections`**, pulling Sections 37–41 into the context |
+
+Every one of the three MCP tools gets exercised across those four queries, and
+you'll see `verify_retry` flip to `True` on at least one.
+
+The same trace is in Postgres per request:
+
+```bash
+docker compose exec -T postgres psql -U civicguard -d civicguard -P pager=off -c "
+SELECT left(query_text,40) AS query, classify_label, retrieval_calls AS rcalls, verify_retry,
+       (SELECT string_agg(e->>'tool_name','|') FROM jsonb_array_elements(tool_calls) e) AS mcp_tools
+FROM rag_request_metrics ORDER BY timestamp DESC LIMIT 5;"
+```
+
+or `docker compose exec gateway python manage.py dump_metrics -n 5`.
+
+---
+
+## 5b. The MCP tool server as an independent service
+
+The MCP server is its own container on `:8100`, talking streamable-http — the
+agent connects to it exactly like any other MCP client. List its tools and call
+each one directly:
+
+```bash
+docker compose exec -T gateway python - <<'PY'
+import asyncio
+from rag_engine.mcp_client import McpToolClient
+c = McpToolClient(url="http://mcp:8100/mcp"); c.wait_ready(20)
+
+tools = asyncio.run_coroutine_threadsafe(c._session.list_tools(), c._loop).result(10)
+print("tools on the server:")
+for t in tools.tools:
+    print(f"  - {t.name}{tuple(t.inputSchema.get('properties', {}))}")
+
+p, lat, ok, _ = c.lookup_section(45)
+print(f"\nlookup_section(45)         found={p['found']} chunks={len(p['chunks'])}  {lat:.0f}ms")
+
+p, lat, ok, _ = c.find_related_sections("Section 45")
+print(f"find_related_sections(45)  references={p['references']}  {lat:.0f}ms")
+
+p, lat, ok, _ = c.search_precedent("murder case law")
+print(f"search_precedent(...)      {p['message']!r}  {lat:.0f}ms")
+
+# call it twice more - the session is reused, warm calls are single-digit ms
+for _ in range(2):
+    _, lat, _, _ = c.lookup_section(33)
+    print(f"lookup_section(33) warm    {lat:.0f}ms")
+c.close()
+PY
+```
+
+Expected: 3 tools listed; `lookup_section` returns real section chunks;
+`find_related_sections` returns `['Section 37', ... 'Section 41', 'Section 33']`;
+`search_precedent` returns *"not yet implemented — case law integration
+planned"* (the stub, by design — not an error); warm calls ~10–30 ms because the
+one connection is reused.
+
+### The agent's graceful fallback when MCP is down
+
+```bash
+docker compose stop mcp
+ask "What does Section 33 say?"          # still answers - retrieve/chain fall back in-process
+curl -s http://localhost:8000/metrics | grep 'mcp_tool_calls_total'   # counter stops climbing
+docker compose start mcp                 # gateway reconnects on the next request
+```
+
+The `done` line's `mcp_tool_calls` will be empty (or show `ok=ERR` entries)
+while `mcp` is stopped, and the answer still comes back — the graph uses its
+in-process regex/retrieval path when the client can't reach the server.
+
+---
+
 ## 6. The synchronous metrics row lands in Postgres immediately
 
 ```bash
@@ -299,27 +419,7 @@ docker compose exec -T postgres psql -U civicguard -d civicguard -P pager=off -c
 
 ---
 
-## 15. MCP tool server directly (optional)
-
-The MCP server is a real container on `:8100`. Call a tool over the same
-transport the agent uses:
-
-```bash
-docker compose exec -T gateway python -c "
-from rag_engine.mcp_client import McpToolClient
-c = McpToolClient(url='http://mcp:8100/mcp'); c.wait_ready(20)
-print('lookup_section(45)     ->', c.lookup_section(45)[0].get('found'), c.lookup_section(45)[1], 'ms')
-print('find_related(45)       ->', c.find_related_sections('Section 45')[0].get('references'))
-print('search_precedent(...)  ->', c.search_precedent('murder')[0])
-c.close()"
-```
-
-`search_precedent` returns the stub message
-(`not yet implemented — case law integration planned`), by design.
-
----
-
-## 16. Tear down
+## 15. Tear down
 
 ```bash
 docker compose down            # stop + remove containers, keep data volumes

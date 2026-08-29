@@ -191,8 +191,11 @@ python retrieval_eval.py                # offline retrieval quality
 ```
 
 **[TESTING.md](TESTING.md)** — a step-by-step manual walkthrough of the whole
-stack (auth, rate limit, metrics row, async eval, audit log, Prometheus,
-Grafana, provider switch, dbt, MCP).
+stack: auth + rate limit, **the retrieval agent's per-query decisions**
+(each classify label, chaining, the verify retry), **the MCP tool server**
+(list + call each tool, and the agent's fallback when it's stopped), the
+synchronous metrics row, async eval, audit log, Prometheus/Grafana, the
+`LLM_PROVIDER` split, and dbt.
 
 ## Disclaimer
 
