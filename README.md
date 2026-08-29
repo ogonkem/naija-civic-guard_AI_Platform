@@ -14,12 +14,6 @@ Prometheus/Grafana, and dbt models over the logs — all wired together in one
 
 ## Architecture
 
-> **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — a detailed walk through
-> every concept in this system (RAG, hybrid retrieval, the LangGraph agent, MCP,
-> the gateway, two-layer observability, async eval, dbt, containerisation) with
-> the trade-offs behind each choice. This section is the map; that doc is the
-> whiteboard.
-
 ```mermaid
 flowchart LR
     U[Client / browser] -->|X-API-Key| GW

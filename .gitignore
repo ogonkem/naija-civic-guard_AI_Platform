@@ -36,3 +36,6 @@ Thumbs.db
 # --- Large Files ---
 *.pdf
 # (Keep the constitution PDF if you want it in the repo, otherwise ignore)
+
+# --- Personal / local-only docs ---
+docs/
