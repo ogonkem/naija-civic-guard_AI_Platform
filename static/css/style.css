@@ -74,6 +74,30 @@ body {
     border-bottom-left-radius: 2px;
 }
 
+/* Agent trace (what classify/retrieve/chain/verify did, live) */
+.agent-trace {
+    margin-bottom: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.agent-trace:empty { display: none; }
+.agent-step {
+    font-size: 12px;
+    color: #4a4a4a;
+    background: #e8ede9;
+    border-left: 3px solid #008751;
+    padding: 4px 10px;
+    border-radius: 3px;
+    animation: fadeIn 0.25s ease-out;
+}
+.agent-step code { background: #d5e5dc; padding: 1px 5px; border-radius: 3px; }
+.agent-step .dim, .agent-summary .dim { color: #7a7a7a; }
+.agent-summary { font-size: 12px; margin-top: 6px; }
+.agent-summary summary { cursor: pointer; color: #008751; }
+.agent-summary .dim { margin: 3px 0 0 12px; }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; } }
+
 /* Loading Animation */
 .loading-dots {
     display: flex;

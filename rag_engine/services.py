@@ -249,20 +249,43 @@ class RagService:
     # ------------------------------------------------------------------ #
     # Graph driver                                                        #
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _apply_state_to_metrics(state, metrics):
+        metrics.classify_label = state.get("classification") or ""
+        metrics.retrieval_calls = state.get("retrieval_calls")
+        metrics.verify_retry = bool(state.get("verify_retry"))
+        metrics.classify_ms = state.get("classify_ms")
+        metrics.retrieve_ms = state.get("retrieve_ms")
+        metrics.chain_ms = state.get("chain_ms")
+        metrics.verify_ms = state.get("verify_ms")
+        metrics.tool_calls = state.get("tool_calls") or []
+        # Keep the Phase 2 field meaningful: retrieval_time_ms == retrieve node.
+        metrics.retrieval_time_ms = state.get("retrieve_ms")
+
+    @staticmethod
+    def _agent_event(node, state, new_tools):
+        """Compact per-node event for the streamed UI trace."""
+        ev = {"type": "agent", "node": node,
+              "ms": round(state.get(f"{node}_ms") or 0.0, 1)}
+        tools = [[t["tool_name"], round(t["tool_latency_ms"]), t["ok"]] for t in new_tools]
+        if node == "classify":
+            ev["label"] = state.get("classification")
+        elif node == "retrieve":
+            ev["calls"] = state.get("retrieval_calls")
+            ev["tools"] = tools
+            ev["sources"] = (state.get("sources") or [])[:6]
+        elif node == "chain":
+            ev["chained"] = state.get("chained_sections") or []
+            ev["tools"] = tools
+        elif node == "verify":
+            ev["retry"] = bool(state.get("needs_retry"))
+        return ev
+
     def run_retrieval_agent(self, user_query: str, metrics: "RequestMetrics | None" = None):
         """Run classify -> retrieve -> chain -> verify; copy trace onto metrics."""
         state = run_agent(self._graph, user_query)
         if metrics is not None:
-            metrics.classify_label = state.get("classification") or ""
-            metrics.retrieval_calls = state.get("retrieval_calls")
-            metrics.verify_retry = bool(state.get("verify_retry"))
-            metrics.classify_ms = state.get("classify_ms")
-            metrics.retrieve_ms = state.get("retrieve_ms")
-            metrics.chain_ms = state.get("chain_ms")
-            metrics.verify_ms = state.get("verify_ms")
-            metrics.tool_calls = state.get("tool_calls") or []
-            # Keep the Phase 2 field meaningful: retrieval_time_ms == retrieve node.
-            metrics.retrieval_time_ms = state.get("retrieve_ms")
+            self._apply_state_to_metrics(state, metrics)
         return state
 
     # ------------------------------------------------------------------ #
@@ -291,14 +314,34 @@ class RagService:
             return {"error": str(e)}
 
     def query_stream(self, user_query: str, metrics: "RequestMetrics | None" = None):
-        """Stream the answer token-by-token, metadata JSON line first.
-
-        Same stream shape as before: one metadata line, then token lines. The
-        retrieval stage is now the LangGraph agent; generation is unchanged.
+        """Stream, in order:
+          * one ``{"type":"agent","node":...}`` line as EACH graph node finishes
+            (classify / retrieve / chain / verify) - this is what the UI shows
+            live as "what the agent is doing"
+          * one ``{"type":"metadata",...}`` line
+          * ``{"type":"token"}`` lines (the answer)
+        Generation is unchanged.
         """
         try:
-            # --- Agentic retrieval: classify -> retrieve -> chain -> verify ---
-            state = self.run_retrieval_agent(user_query, metrics=metrics)
+            # --- Agentic retrieval, streamed node-by-node ---
+            initial = {
+                "query": user_query, "original_query": user_query,
+                "retrieval_calls": 0, "retry_count": 0,
+                "classify_ms": 0.0, "retrieve_ms": 0.0, "chain_ms": 0.0, "verify_ms": 0.0,
+                "verify_retry": False, "chained_sections": [], "tool_calls": [],
+            }
+            state = dict(initial)
+            seen_tools = 0
+            for step in self._graph.stream(initial):
+                for node, update in step.items():
+                    state.update(update)
+                    all_tools = state.get("tool_calls") or []
+                    new_tools, seen_tools = all_tools[seen_tools:], len(all_tools)
+                    yield json.dumps(self._agent_event(node, state, new_tools)) + "\n"
+
+            if metrics is not None:
+                self._apply_state_to_metrics(state, metrics)
+
             docs = state["docs"]
             sources = state.get("sources") or list(
                 {d.metadata.get("section") for d in docs}

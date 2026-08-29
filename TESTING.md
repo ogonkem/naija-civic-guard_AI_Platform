@@ -389,12 +389,35 @@ is identical for both. Switch back with `LLM_PROVIDER=openai docker compose up -
 
 ---
 
-## 13. The browser chat page
+## 13. The browser chat page — agent trace live
 
 Open <http://localhost:8000/>. It provisions its own `browser-ui` API key
-(embedded in the page), so you can just type a question and hit **Ask AI** —
-the answer streams in with its source sections and generation time. A 429 or
-401 shows a readable message instead of a blank error.
+(embedded in the page), so just type a question and hit **Ask AI**.
+
+Above each answer you see the agent working, one line per graph node as it
+finishes:
+
+```
+classify → cross_reference · 623 ms
+retrieve · 1 call(s) · 36 ms
+  ↳ Section 4, Section 17, Section 185
+chain · 33 ms · find_related_sections 18ms, find_related_sections 15ms · no new cross-refs
+verify · 0.4 ms · ⚠ inadequate → retrying once
+retrieve · 4 call(s) · 66 ms
+  ↳ Section 4, Section 20, Section 128
+chain · 69 ms · ...
+verify · 0.5 ms · ok
+▸ agent trace — cross_reference, 6 retrieval call(s), 1 retry   (click to expand node timings + MCP calls)
+```
+
+Then the answer streams in with its sources and total time. Try a
+`direct_lookup` ("What does Section 33 say?"), a `cross_reference` ("which
+sections relate to…"), and a chaining query ("Section 45 … sections 37 to 41")
+to watch the trace change shape. A 429/401 shows a readable message instead.
+
+Under the hood the gateway emits `{"type":"agent","node":...}` NDJSON lines
+before the metadata line — same events as the `done` line's `agent` /
+`mcp_tool_calls` blocks, just streamed as they happen.
 
 ---
 
