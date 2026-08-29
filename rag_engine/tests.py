@@ -6,7 +6,7 @@ request-metrics row (Phase 2a), and the asynchronous evaluation task (Phase 2b).
 import json
 
 from django.core.cache import cache
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 from django.urls import reverse
 from langchain_core.documents import Document
 from rest_framework import status
@@ -353,6 +353,13 @@ class GatewayTestCase(APITestCase):
         self.assertEqual(audit.api_key_hint, "ncg_bogus"[:12])
         self.assertEqual(RequestMetric.objects.count(), 0)
 
+    # Tests run with DEBUG=False, so the manifest static storage would need a
+    # collected staticfiles.json just to render {% static %}. Use plain storage
+    # for this template-rendering test.
+    @override_settings(STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    })
     def test_chat_page_embeds_a_working_api_key(self):
         """GET / auto-provisions a 'browser-ui' key and embeds it so the
         bundled chat page can authenticate against the gateway."""
