@@ -13,6 +13,27 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - OLLAMA_BASE_URL=http://ollama:11434
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  worker:
+    build: .
+    command: celery -A civic_guard worker -Q eval -l info --concurrency=2
+    volumes:
+      - .:/app
+      - chroma_data:/app/chroma_db
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    restart: always
 
   nginx:
     image: nginx:1.25-alpine

@@ -166,3 +166,7 @@ zstandard==0.25.0
 gunicorn==20.1.0
 whitenoise[brotli]>=6.0.0
 
+
+# --- Async evaluation (Phase 2b) ---
+celery[redis]>=5.4,<6
+redis>=5.0

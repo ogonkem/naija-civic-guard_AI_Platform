@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
+import os
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -17,21 +18,31 @@ from dotenv import load_dotenv
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Load .env once, here, for the whole project (LangSmith flags, GROQ_API_KEY,
-# etc.). Request-path code must not call load_dotenv() itself.
+# Load .env once, here, for the whole project (SECRET_KEY, GROQ_API_KEY,
+# LangSmith flags, etc.). Request-path code must not call load_dotenv() itself.
 load_dotenv(BASE_DIR / '.env')
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+def _env_bool(name, default=False):
+    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-cf%l*bl76qr2!2(rfkayefiq(7op360t7%=e5v%086!cyb&ht9'
+# Falls back to an insecure dev key so `runserver` works out of the box; set
+# DJANGO_SECRET_KEY in .env for anything deployed. Generate one with:
+#   python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+SECRET_KEY = os.getenv(
+    "DJANGO_SECRET_KEY",
+    "django-insecure-dev-only-key-change-me-in-production",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = _env_bool("DJANGO_DEBUG", default=True)
 
-ALLOWED_HOSTS = []
+# Comma-separated list, e.g. "example.com,www.example.com"
+ALLOWED_HOSTS = [h.strip() for h in os.getenv("DJANGO_ALLOWED_HOSTS", "").split(",") if h.strip()]
+if DEBUG and not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ["localhost", "127.0.0.1", "[::1]"]
 
 
 # Application definition
@@ -140,3 +151,30 @@ STORAGE = {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     }
 }
+
+
+# --- Celery (async RAG evaluation only) ---------------------------------------
+# https://docs.celeryq.dev/en/stable/userguide/configuration.html
+_REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", _REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", _REDIS_URL)
+
+CELERY_TASK_DEFAULT_QUEUE = "eval"
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_ACKS_LATE = True
+CELERY_RESULT_EXPIRES = 3600  # seconds
+
+# Fail fast (and loudly, in the log) when the broker is unreachable instead of
+# hanging the request thread that is trying to enqueue. The enqueue site also
+# catches the resulting error - a missing broker must never break a response.
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = False
+CELERY_BROKER_TRANSPORT_OPTIONS = {"socket_connect_timeout": 2, "socket_timeout": 2}
+CELERY_TASK_TIME_LIMIT = 120
+
+# For local/dev without Redis: set CELERY_TASK_ALWAYS_EAGER=1 to run tasks
+# inline (they still write eval_results, but NOT decoupled from the request).
+CELERY_TASK_ALWAYS_EAGER = _env_bool("CELERY_TASK_ALWAYS_EAGER", default=False)
+CELERY_TASK_EAGER_PROPAGATES = False

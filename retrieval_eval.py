@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 from typing import List, Dict
 from rag_engine.services import RagService
+from rag_engine.eval_core import reciprocal_rank, section_hit, keyword_coverage
 
 class JSONLRetrievalEvaluator:
     """Evaluator for RAG retrieval performance with Markdown export."""
@@ -45,23 +46,17 @@ class JSONLRetrievalEvaluator:
             
             print(f"DEBUG: Query: {test['query'][:30]}... | Target: '{test['target']}' | Found: {retrieved_sections}")
             
-            retrieved_text = " ".join([doc.page_content.lower() for doc in retrieved_docs])
+            retrieved_text = " ".join([doc.page_content for doc in retrieved_docs])
 
-            # MRR Calculation
-            mrr = 0.0
-            for i, section in enumerate(retrieved_sections):
-                if section == test["target"]:
-                    mrr = 1 / (i + 1)
-                    break
-
-            # Keyword Coverage
-            found = [k for k in test["keywords"] if k.lower() in retrieved_text]
-            coverage = len(found) / len(test["keywords"])
+            # Shared metric helpers (also used by the async per-request evaluator).
+            mrr = reciprocal_rank(retrieved_sections, test["target"])
+            coverage = keyword_coverage(test["keywords"], retrieved_text) or 0.0
+            hit = 1.0 if section_hit(retrieved_sections, test["target"]) else 0.0
 
             res_entry = {
                 "mrr": mrr,
                 "coverage": coverage,
-                "hit": 1.0 if mrr > 0 else 0.0
+                "hit": hit,
             }
             results.append(res_entry)
             
