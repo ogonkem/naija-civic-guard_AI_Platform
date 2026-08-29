@@ -1,0 +1,32 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Naija Constitution AI</title>
+    <link rel="stylesheet" href="{% static 'css/style.css' %}">
+</head>
+<body>
+
+    <div class="sidebar">
+        <div class="logo">🇳🇬 NIGERIAN<br>CONSTITUTION RAG</div>
+    </div>
+
+    <div class="main-content">
+        <div class="top-bar">Disclaimer: AI Tool. Verify with Official Gazette.</div>
+        <div id="chat-window">
+            <div class="msg bot">Ask me about your rights or Nigerian law.</div>
+        </div>
+
+        <div class="input-wrapper">
+            <div class="input-group">
+                <input type="text" id="userInput" placeholder="Ask about your fundamental rights..." autocomplete="off">
+                <button id="sendBtn">Ask AI</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="{% static 'js/chat.js' %}"></script>
+</body>
+</html>

@@ -1,0 +1,37 @@
+# --- Python & Virtual Environment ---
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+db.sqlite3
+.env
+
+# --- Django Specific ---
+db.sqlite3
+# media/
+# static/
+# staticfiles/
+.python-version
+
+# --- RAG & Vector Database ---
+# We ignore the local vector store because it's built from the PDF
+# In production, you'd rebuild this on the server or use a cloud DB
+chroma_db/
+
+# --- Evaluation & Logs ---
+.ragas/
+logs/
+*.log
+evaluate_report.json
+
+# --- OS & IDE Specific ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Large Files ---
+*.pdf
+# (Keep the constitution PDF if you want it in the repo, otherwise ignore)
