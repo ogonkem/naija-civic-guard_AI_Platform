@@ -85,6 +85,10 @@ REST_FRAMEWORK = {
     },
 }
 
+# Optional: pin the key the bundled browser chat page uses. If empty, the
+# chat_page view auto-provisions a dedicated "browser-ui" ApiKey.
+BROWSER_API_KEY = os.getenv("BROWSER_API_KEY", "")
+
 ROOT_URLCONF = 'civic_guard.urls'
 
 TEMPLATES = [

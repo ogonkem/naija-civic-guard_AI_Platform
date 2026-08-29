@@ -2,8 +2,8 @@ const chatWindow = document.getElementById('chat-window');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
 
-// Retrieve the CSRF token from the DOM attribute
-const csrfToken = document.body.getAttribute('data-csrf');
+// Gateway API key, injected into the page by the chat_page view.
+const apiKey = document.querySelector('meta[name="api-key"]')?.content || '';
 
 async function handleSend() {
     const text = userInput.value.trim();
@@ -28,13 +28,26 @@ async function handleSend() {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
-                'X-CSRFToken': csrfToken
+                'X-API-Key': apiKey
             },
             body: JSON.stringify({ query: text })
         });
 
-        // 3. Consume the newline-delimited JSON stream, rendering tokens live.
         const loadingEl = document.getElementById(loadingId);
+
+        // Gateway rejections (401 / 429) come back as a JSON error, not a stream.
+        if (!response.ok) {
+            let detail = '';
+            try { detail = (await response.json()).detail || ''; } catch (e) {}
+            loadingEl.textContent =
+                response.status === 429 ? (detail || 'Rate limit reached — wait a moment and try again.') :
+                response.status === 401 ? 'This page is not authorized (missing or invalid API key).' :
+                `Request failed (HTTP ${response.status}).`;
+            chatWindow.scrollTop = chatWindow.scrollHeight;
+            return;
+        }
+
+        // 3. Consume the newline-delimited JSON stream, rendering tokens live.
         loadingEl.textContent = '';
 
         const reader = response.body.getReader();

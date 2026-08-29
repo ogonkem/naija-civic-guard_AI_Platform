@@ -352,3 +352,17 @@ class GatewayTestCase(APITestCase):
         self.assertIsNone(audit.api_key_id)
         self.assertEqual(audit.api_key_hint, "ncg_bogus"[:12])
         self.assertEqual(RequestMetric.objects.count(), 0)
+
+    def test_chat_page_embeds_a_working_api_key(self):
+        """GET / auto-provisions a 'browser-ui' key and embeds it so the
+        bundled chat page can authenticate against the gateway."""
+        self.assertFalse(ApiKey.objects.filter(owner="browser-ui").exists())
+        resp = self.client.get(reverse("chat_page"))
+        self.assertEqual(resp.status_code, 200)
+
+        key = ApiKey.objects.get(owner="browser-ui")
+        self.assertContains(resp, f'<meta name="api-key" content="{key.key}">', html=False)
+
+        # a second load reuses the same key, doesn't pile up rows
+        self.client.get(reverse("chat_page"))
+        self.assertEqual(ApiKey.objects.filter(owner="browser-ui").count(), 1)

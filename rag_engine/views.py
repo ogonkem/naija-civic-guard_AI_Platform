@@ -31,9 +31,30 @@ def get_rag_service():
     return _rag_service
 
 
+def _browser_api_key() -> str:
+    """API key the bundled browser chat page authenticates with.
+
+    Operator can pin one via settings.BROWSER_API_KEY; otherwise a dedicated
+    'browser-ui' key is auto-provisioned on first page load so the page just
+    works after `migrate`. It's rate-limited like any other key and can be
+    deactivated in the admin to lock the page down.
+    """
+    from django.conf import settings
+    from .models import ApiKey
+
+    pinned = getattr(settings, "BROWSER_API_KEY", "") or ""
+    if pinned:
+        return pinned
+    key = (ApiKey.objects.filter(owner="browser-ui", is_active=True)
+           .order_by("created_at").first())
+    if key is None:
+        key = ApiKey.objects.create(owner="browser-ui", requests_per_minute=30)
+    return key.key
+
+
 def chat_page(request):
-    """Renders the chat interface for user interaction with the RAG engine."""
-    return render(request, 'chat.html')
+    """Renders the chat interface, embedding the browser's API key."""
+    return render(request, "chat.html", {"browser_api_key": _browser_api_key()})
 
 
 class ChatView(APIView):
