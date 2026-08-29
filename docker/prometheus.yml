@@ -1,0 +1,23 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Gateway: django-prometheus /metrics (request/response + the custom
+  # request-path series: request_latency_seconds, generation_tokens_per_second,
+  # mcp_tool_calls_total, agent_retries_total, llm_provider_requests_total).
+  - job_name: gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]
+
+  # Celery eval worker: its own registry (eval_keyword_coverage,
+  # celery_eval_task_duration_seconds, celery_queue_depth,
+  # celery_eval_task_failures_total).
+  - job_name: celery-worker
+    static_configs:
+      - targets: ["worker:9540"]

@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 
 from .authentication import ApiKeyAuthentication
 from .metrics import RequestMetrics
+from .metrics_prom import record_request_metrics
 from .throttling import ApiKeyRateThrottle
 
 logger = logging.getLogger(__name__)
@@ -130,8 +131,9 @@ class ChatView(APIView):
                 if metrics.total_time_ms is None:  # client disconnected mid-stream
                     metrics.total_time_ms = (time.perf_counter() - request_start) * 1000.0
                     metrics.finalize()
-                metrics.persist()          # Phase 2a: single inline INSERT, not deferred
-                _enqueue_eval(metrics)     # Phase 2b: fire-and-forget hand-off
+                metrics.persist()               # Phase 2a: single inline INSERT
+                record_request_metrics(metrics)  # Phase 7: same numbers -> Prometheus
+                _enqueue_eval(metrics)          # Phase 2b: fire-and-forget hand-off
 
         response = StreamingHttpResponse(event_stream(), content_type="application/x-ndjson")
         # Defeat proxy/browser buffering so tokens arrive as they are produced.

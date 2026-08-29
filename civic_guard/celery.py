@@ -18,3 +18,7 @@ app.config_from_object("django.conf:settings", namespace="CELERY")
 
 # Discover tasks.py in every installed app (finds rag_engine/tasks.py).
 app.autodiscover_tasks()
+
+# Register the worker's Prometheus metrics HTTP server + queue-depth poller
+# (connects a worker_ready signal handler).
+import rag_engine.celery_metrics  # noqa: E402,F401

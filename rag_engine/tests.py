@@ -6,7 +6,7 @@ request-metrics row (Phase 2a), and the asynchronous evaluation task (Phase 2b).
 import json
 
 from django.core.cache import cache
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from langchain_core.documents import Document
 from rest_framework import status
@@ -473,3 +473,79 @@ class GatewayTestCase(APITestCase):
         # a second load reuses the same key, doesn't pile up rows
         self.client.get(reverse("chat_page"))
         self.assertEqual(ApiKey.objects.filter(owner="browser-ui").count(), 1)
+
+
+class PrometheusMetricsTests(TestCase):
+    """Phase 7: /metrics endpoint + custom metrics fed from RequestMetrics."""
+
+    def test_metrics_endpoint_exposes_custom_series(self):
+        resp = self.client.get("/metrics")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        for name in (
+            "request_latency_seconds",
+            "generation_tokens_per_second",
+            "mcp_tool_calls_total",
+            "agent_retries_total",
+            "llm_provider_requests_total",
+            "django_http_requests_total_by_method_total",  # django-prometheus auto
+        ):
+            self.assertIn(name, body)
+
+    def test_normalize_provider(self):
+        from rag_engine.metrics_prom import normalize_provider
+        self.assertEqual(normalize_provider("groq"), "openai")
+        self.assertEqual(normalize_provider("openai"), "openai")
+        self.assertEqual(normalize_provider("ChatOllama"), "ollama")
+        self.assertEqual(normalize_provider("ollama"), "ollama")
+
+    def test_record_request_metrics_feeds_registry_from_same_object(self):
+        from prometheus_client import REGISTRY
+        from rag_engine.metrics import RequestMetrics
+        from rag_engine.metrics_prom import record_request_metrics
+
+        def val(name, labels=None):
+            return REGISTRY.get_sample_value(name, labels) or 0.0
+
+        before_req = val("llm_provider_requests_total", {"provider": "ollama"})
+        before_tool = val("mcp_tool_calls_total", {"tool_name": "lookup_section"})
+        before_retry = val("agent_retries_total")
+        before_lat = val("request_latency_seconds_count", {"stage": "generation"})
+
+        m = RequestMetrics(query_text="q", provider="ollama")
+        m.generation_time_ms = 900.0
+        m.total_time_ms = 1000.0
+        m.retrieve_ms = 20.0
+        m.tokens_per_second = 55.0
+        m.verify_retry = True
+        m.tool_calls = [
+            {"tool_name": "lookup_section", "tool_latency_ms": 12.0, "ok": True, "error": None},
+            {"tool_name": "find_related_sections", "tool_latency_ms": 30.0, "ok": True, "error": None},
+        ]
+        record_request_metrics(m)
+
+        self.assertEqual(val("llm_provider_requests_total", {"provider": "ollama"}), before_req + 1)
+        self.assertEqual(val("mcp_tool_calls_total", {"tool_name": "lookup_section"}), before_tool + 1)
+        self.assertEqual(val("agent_retries_total"), before_retry + 1)
+        self.assertEqual(val("request_latency_seconds_count", {"stage": "generation"}), before_lat + 1)
+        self.assertEqual(
+            val("generation_tokens_per_second_count", {"provider": "ollama"}),
+            (REGISTRY.get_sample_value("generation_tokens_per_second_count", {"provider": "ollama"}) or 0.0),
+        )
+
+    def test_eval_task_records_duration_and_coverage(self):
+        from prometheus_client import REGISTRY
+        before_dur = REGISTRY.get_sample_value("celery_eval_task_duration_seconds_count") or 0.0
+
+        evaluate_request_task.apply(kwargs=dict(
+            request_id="33333333-3333-3333-3333-333333333333",
+            query="In whom are the legislative powers of the Federation vested?",
+            retrieved_context=["the National Assembly, a Senate and a House of Representatives"],
+            retrieved_section_ids=["Section 4"],
+            response_text="the National Assembly",
+        ))
+
+        after_dur = REGISTRY.get_sample_value("celery_eval_task_duration_seconds_count") or 0.0
+        self.assertEqual(after_dur, before_dur + 1)
+        # ground-truth query -> coverage gauge is set
+        self.assertIsNotNone(REGISTRY.get_sample_value("eval_keyword_coverage"))

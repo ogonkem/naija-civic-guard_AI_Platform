@@ -8,10 +8,16 @@ a normal state, not an error.
 """
 
 import logging
+import time
 
 from celery import shared_task
 
 from .eval_core import evaluate_retrieval
+from .metrics_prom import (
+    celery_eval_task_duration_seconds,
+    celery_eval_task_failures_total,
+    eval_keyword_coverage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +37,7 @@ def evaluate_request_task(self, request_id, query, retrieved_context,
     """
     from .models import EvalResult  # lazy import: app registry must be ready
 
+    t0 = time.perf_counter()
     try:
         scored = evaluate_retrieval(
             query=query,
@@ -51,6 +58,10 @@ def evaluate_request_task(self, request_id, query, retrieved_context,
             reciprocal_rank=scored["reciprocal_rank"],
         )
 
+        # gauge: last eval-set query's coverage (only when there's ground truth)
+        if scored["matched_ground_truth"] and scored["keyword_coverage"] is not None:
+            eval_keyword_coverage.set(scored["keyword_coverage"])
+
         logger.info(
             "eval ok request_id=%s matched_gt=%s coverage=%s hit=%s source=%s",
             request_id, scored["matched_ground_truth"],
@@ -59,7 +70,10 @@ def evaluate_request_task(self, request_id, query, retrieved_context,
         return {"request_id": str(request_id), "ok": True}
 
     except Exception:
+        celery_eval_task_failures_total.inc()
         # Visible in the Celery worker log; the request itself is long gone and
         # unaffected.
         logger.exception("evaluate_request_task failed request_id=%s", request_id)
         raise
+    finally:
+        celery_eval_task_duration_seconds.observe(time.perf_counter() - t0)

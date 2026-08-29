@@ -1,0 +1,24 @@
+# Keep the build context small. Runtime state comes from volumes / env_file /
+# the ingest step - not baked into the image.
+.venv/
+venv/
+env/
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+*.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.vscode/
+.idea/
+.DS_Store
+
+.env
+db.sqlite3
+chroma_db/
+staticfiles/
+
+# docs / scratch (README is small and handy to have in the image)
+eval_report.md

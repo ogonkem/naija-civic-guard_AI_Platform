@@ -19,7 +19,6 @@ import re
 import logging
 from typing import List
 from dotenv import load_dotenv
-from huggingface_hub import login
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -29,6 +28,7 @@ from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 
 from rag_engine.sections import SECTION_TAG_PATTERN
+from rag_engine.chroma import COLLECTION_NAME, get_chroma_client
 
 # Set up logging for professional tracking
 logging.basicConfig(level=logging.INFO)
@@ -43,15 +43,10 @@ class ConstitutionIngestor:
         self.db_dir = db_dir
         # Shared with the LangGraph chain node (rag_engine/sections.py).
         self.section_pattern = SECTION_TAG_PATTERN
-        
+
         load_dotenv(override=True)
-        hf_api_token = os.getenv('HF_API_TOKEN')
-        if hf_api_token:
-            login(token=hf_api_token)
-        else:
-            logger.warning("HF_API_TOKEN not found in environment variables. Embeddings may fail.")
-        
-        # this will now use authenticated session
+        # all-MiniLM-L6-v2 is public - no huggingface_hub.login() (a bad/expired
+        # HF_API_TOKEN would otherwise crash the container's AUTO_INGEST step).
         self.embeddings = HuggingFaceEmbeddings(
             model_name="all-MiniLM-L6-v2"
         )
@@ -96,13 +91,15 @@ class ConstitutionIngestor:
             
             logger.info(f"Cleaned {len(all_splits) - len(splits)} noisy chunks.")
 
-            # 4. Vector Store (Semantic)
+            # 4. Vector Store (Semantic). get_chroma_client() -> a local
+            # PersistentClient (writes ./chroma_db) or a networked ChromaDB
+            # server when CHROMA_HOST is set (docker-compose).
             logger.info("Rebuilding Vector Store...")
-            # YOU MUST DELETE ./chroma_db FOLDER MANUALLY BEFORE RUNNING THIS
             vectorstore = Chroma.from_documents(
                 documents=splits,
                 embedding=self.embeddings,
-                persist_directory=self.db_dir
+                client=get_chroma_client(),
+                collection_name=COLLECTION_NAME,
             )
 
             # 5. Hybrid Ensemble - Optimized for Legal Search

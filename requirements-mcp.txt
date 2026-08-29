@@ -1,0 +1,4 @@
+# Minimal deps for the standalone MCP tool server (rag_engine/mcp_server.py).
+# It only needs the MCP SDK + a ChromaDB client + rag_engine/sections.py.
+mcp==1.27.1
+chromadb==1.5.9

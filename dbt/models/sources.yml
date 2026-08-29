@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: gateway
+    description: Tables written by the Django gateway + Celery eval worker.
+    schema: public
+    tables:
+      - name: rag_request_metrics
+        description: One row per RAG request (Phase 2a/6/7). Latency + throughput
+          + agent trace, written synchronously by the gateway.
+      - name: eval_results
+        description: One row per evaluated request (Phase 2b), written async by
+          the Celery worker. Joins to rag_request_metrics on request_id.

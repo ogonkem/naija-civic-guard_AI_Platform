@@ -1,0 +1,15 @@
+# dbt connection profile. Env vars line up with docker-compose / .env so
+# `docker compose --profile analytics run --rm dbt build` just works; for a
+# local run, export the same vars pointing at your Postgres.
+civic_guard:
+  target: dev
+  outputs:
+    dev:
+      type: postgres
+      host: "{{ env_var('POSTGRES_HOST', 'postgres') }}"
+      port: "{{ env_var('POSTGRES_PORT', '5432') | int }}"
+      user: "{{ env_var('POSTGRES_USER', 'civicguard') }}"
+      password: "{{ env_var('POSTGRES_PASSWORD', 'civicguard') }}"
+      dbname: "{{ env_var('POSTGRES_DB', 'civicguard') }}"
+      schema: analytics
+      threads: 4

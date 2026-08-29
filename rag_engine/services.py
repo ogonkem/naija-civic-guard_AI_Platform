@@ -15,6 +15,7 @@ import time
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
 from langchain_community.retrievers import BM25Retriever
@@ -24,6 +25,7 @@ from langchain_groq import ChatGroq
 from .metrics import RequestMetrics
 from .graph import build_agent_graph, run_agent, CLASSES
 from .mcp_client import get_mcp_client
+from .chroma import COLLECTION_NAME, get_chroma_client
 
 logger = logging.getLogger(__name__)
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
@@ -44,8 +46,11 @@ class RagService:
         # 2. Vector store + hybrid retriever (ChromaDB semantic + BM25 keyword),
         # matching ingest.py's EnsembleRetriever design. BM25 isn't persisted,
         # so it's rebuilt here from the documents already in the Chroma store.
+        # get_chroma_client() is a local persistent dir, or a ChromaDB server
+        # container when CHROMA_HOST is set.
         self.vectorstore = Chroma(
-            persist_directory="chroma_db",
+            client=get_chroma_client(),
+            collection_name=COLLECTION_NAME,
             embedding_function=self.embeddings,
         )
         self._vector_retriever = self.vectorstore.as_retriever(
@@ -53,31 +58,22 @@ class RagService:
         )
         self._hybrid = self._build_hybrid_retriever()
 
-        # 3a. Generation LLM (the "main" model).
-        # self.llm = ChatOllama(model="llama3", temperature=0, base_url=OLLAMA_URL)
-        self.llm = ChatGroq(
-            model=os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant"),
-            temperature=0,
-            timeout=30,
-            max_retries=2,
+        # 3a. Generation LLM. LLM_PROVIDER selects it; the Prometheus split
+        # (llm_provider_requests_total, generation_tokens_per_second) is on
+        # ollama|openai, where "openai" = any OpenAI-compatible hosted API.
+        self.llm, self.llm_provider = self._build_generation_llm()
+        self.llm_model = (
+            getattr(self.llm, "model_name", None) or getattr(self.llm, "model", "") or ""
         )
+
         # 3b. Cheap/fast LLM used ONLY for the classify + verify nodes - never
-        # for generation. Override with CLASSIFY_LLM_MODEL.
+        # for generation. Stays on Groq (fast/cheap); heuristic fallback covers
+        # an outage. Override with CLASSIFY_LLM_MODEL.
         self.classify_llm = ChatGroq(
             model=os.getenv("CLASSIFY_LLM_MODEL", "allam-2-7b"),
             temperature=0,
             timeout=15,
             max_retries=1,
-        )
-
-        if isinstance(self.llm, ChatGroq):
-            self.llm_provider = "groq"
-        elif isinstance(self.llm, ChatOllama):
-            self.llm_provider = "ollama"
-        else:
-            self.llm_provider = self.llm.__class__.__name__.lower()
-        self.llm_model = (
-            getattr(self.llm, "model_name", None) or getattr(self.llm, "model", "") or ""
         )
         self.classify_model = (
             getattr(self.classify_llm, "model_name", None)
@@ -122,6 +118,34 @@ class RagService:
             self.embeddings.embed_query("warmup")
         except Exception as exc:  # best-effort only
             logger.warning(f"Embedding warmup failed: {exc}")
+
+    # ------------------------------------------------------------------ #
+    # LLM selection                                                       #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _build_generation_llm():
+        """Returns (llm, provider_label). LLM_PROVIDER: openai (default) | ollama."""
+        provider = os.getenv("LLM_PROVIDER", "openai").lower()
+        if provider == "ollama":
+            llm = ChatOllama(
+                model=os.getenv("OLLAMA_LLM_MODEL", "llama3.2"),
+                base_url=os.getenv("OLLAMA_BASE_URL", OLLAMA_URL),
+                temperature=0,
+            )
+            return llm, "ollama"
+        # "openai" == an OpenAI-compatible hosted API. Default target is Groq
+        # (works with the existing GROQ_API_KEY); point OPENAI_BASE_URL /
+        # OPENAI_API_KEY at real OpenAI to use that instead.
+        llm = ChatOpenAI(
+            model=os.getenv("OPENAI_LLM_MODEL", os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-20b")),
+            base_url=os.getenv("OPENAI_BASE_URL", "https://api.groq.com/openai/v1"),
+            api_key=os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY", ""),
+            temperature=0,
+            timeout=30,
+            max_retries=2,
+            stream_usage=True,   # exact output-token count on the final chunk
+        )
+        return llm, "openai"
 
     # ------------------------------------------------------------------ #
     # Retrieval primitives used by the graph nodes                        #

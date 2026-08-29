@@ -29,7 +29,10 @@ _CALL_TIMEOUT = float(os.getenv("MCP_CALL_TIMEOUT", "15"))
 
 
 class McpToolClient:
-    def __init__(self, server_args=None, env=None):
+    def __init__(self, server_args=None, env=None, url=None):
+        # url set  -> connect to a networked MCP server (streamable-http);
+        # url None -> spawn `python -m rag_engine.mcp_server` over stdio.
+        self._url = url or os.getenv("MCP_SERVER_URL") or None
         self._params = StdioServerParameters(
             command=sys.executable,
             args=server_args or ["-m", "rag_engine.mcp_server"],
@@ -50,10 +53,17 @@ class McpToolClient:
         from contextlib import AsyncExitStack
         try:
             self._stack = AsyncExitStack()
-            read, write = await self._stack.enter_async_context(stdio_client(self._params))
+            if self._url:
+                from mcp.client.streamable_http import streamablehttp_client
+                streams = await self._stack.enter_async_context(streamablehttp_client(self._url))
+                read, write = streams[0], streams[1]     # (read, write, get_session_id)
+                where = self._url
+            else:
+                read, write = await self._stack.enter_async_context(stdio_client(self._params))
+                where = " ".join(self._params.args)
             self._session = await self._stack.enter_async_context(ClientSession(read, write))
             await self._session.initialize()
-            logger.info("MCP client connected (%s)", " ".join(self._params.args))
+            logger.info("MCP client connected (%s)", where)
         except Exception as exc:  # noqa: BLE001
             self._start_err = exc
             logger.warning("MCP client failed to start: %s", exc)

@@ -1,0 +1,28 @@
+version: 2
+
+models:
+  - name: daily_query_volume
+    description: Per-day request counts (total, errored, agent-retried, evaluated)
+      plus average latency and tokens.
+    columns:
+      - name: day
+        tests: [not_null, unique]
+
+  - name: avg_latency_by_provider_and_stage
+    description: avg / p50 / p95 latency per pipeline stage, split by LLM provider.
+      Feeds the README Performance table.
+    columns:
+      - name: provider
+        tests: [not_null]
+      - name: stage
+        tests:
+          - not_null
+          - accepted_values:
+              values: [classify, retrieval, chain, verify, generation, total]
+
+  - name: eval_score_trend
+    description: Retrieval quality (hit rate, MRR, keyword coverage) per day and
+      provider, over eval-set queries only.
+    columns:
+      - name: day
+        tests: [not_null]

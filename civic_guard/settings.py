@@ -48,22 +48,25 @@ if DEBUG and not ALLOWED_HOSTS:
 # Application definition
 
 INSTALLED_APPS = [
+    'django_prometheus',   # /metrics + automatic request/response series
+
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    
+
     # third-party apps
     'rest_framework',
     'corsheaders',
-    
+
     # local apps
     'rag_engine',
 ]
 
 MIDDLEWARE = [
+    'django_prometheus.middleware.PrometheusBeforeMiddleware',  # first
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -75,6 +78,7 @@ MIDDLEWARE = [
     # Gateway audit log - last, so it sees the final status of every /api/
     # request (including the 401/429 that never reach the view).
     'rag_engine.middleware.AuditLogMiddleware',
+    'django_prometheus.middleware.PrometheusAfterMiddleware',   # last
 ]
 
 # --- DRF gateway (API-key auth + per-key rate limit) ---
@@ -109,15 +113,31 @@ TEMPLATES = [
 WSGI_APPLICATION = 'civic_guard.wsgi.application'
 
 
-# Database
+# Database - Postgres when POSTGRES_HOST is set (docker-compose), else SQLite
+# so `runserver` / tests keep working with no extra service. The RequestMetric
+# writer (Phase 2a) and the Celery eval_results writer (Phase 2b) both go
+# through the Django ORM, so pointing `default` here moves both to Postgres
+# with no code change and the same schema/migrations.
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
-
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+if os.getenv("POSTGRES_HOST"):
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.getenv("POSTGRES_DB", "civicguard"),
+            "USER": os.getenv("POSTGRES_USER", "civicguard"),
+            "PASSWORD": os.getenv("POSTGRES_PASSWORD", ""),
+            "HOST": os.getenv("POSTGRES_HOST"),
+            "PORT": os.getenv("POSTGRES_PORT", "5432"),
+            "CONN_MAX_AGE": int(os.getenv("DB_CONN_MAX_AGE", "60")),
+        }
     }
-}
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
 
 
 # Password validation

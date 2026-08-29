@@ -15,13 +15,16 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import include, path
 from rag_engine.views import ChatView, chat_page
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    
+
+    # Prometheus scrape target: /metrics (django-prometheus, no auth).
+    path('', include('django_prometheus.urls')),
+
     # API endpoint for RAG chat queries
-    path('api/chat/', ChatView.as_view(), name='chat'),  # Route for RAG chat endpoint
-    path('', chat_page, name='chat_page'),  # Route for the chat page
+    path('api/chat/', ChatView.as_view(), name='chat'),
+    path('', chat_page, name='chat_page'),  # the chat page
 ]

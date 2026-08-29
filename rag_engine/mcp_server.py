@@ -12,15 +12,17 @@ import json
 import os
 import re
 
-import chromadb
 from mcp.server.fastmcp import FastMCP
 
+from rag_engine.chroma import COLLECTION_NAME, get_chroma_client
 from rag_engine.sections import find_section_references
 
-CHROMA_PATH = os.getenv("CHROMA_DB_PATH", "chroma_db")
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "langchain")  # langchain_chroma default
-
-mcp = FastMCP("naija-civic-guard-tools", log_level=os.getenv("MCP_LOG_LEVEL", "WARNING"))
+mcp = FastMCP(
+    "naija-civic-guard-tools",
+    log_level=os.getenv("MCP_LOG_LEVEL", "WARNING"),
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("MCP_PORT", "8100")),
+)
 
 _collection = None
 
@@ -28,7 +30,7 @@ _collection = None
 def _get_collection():
     global _collection
     if _collection is None:
-        _collection = chromadb.PersistentClient(path=CHROMA_PATH).get_collection(COLLECTION_NAME)
+        _collection = get_chroma_client().get_collection(COLLECTION_NAME)
     return _collection
 
 
@@ -109,4 +111,6 @@ def search_precedent(query: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    # stdio for a gateway-spawned subprocess (local dev); streamable-http when
+    # the MCP server runs as its own container.
+    mcp.run(transport=os.getenv("MCP_TRANSPORT", "stdio"))

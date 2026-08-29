@@ -1,294 +1,196 @@
-# 🇳🇬 Naija Civic Guard: Nigerian Constitution RAG
+# Naija Civic Guard
 
-Empowering citizens with AI-driven, verifiable insights into the Nigerian Constitution.
+**A retrieval platform for the Nigerian Constitution — with the operational
+scaffolding a team needs to actually run it.**
 
-Naija Civic Guard is a Retrieval-Augmented Generation (RAG) system grounded in the
-text of the Constitution of the Federal Republic of Nigeria. For each question it
-retrieves the relevant constitutional sections and asks an LLM to answer **only**
-from that retrieved context, returning the source section numbers alongside every
-answer.
+Ask a question in plain English, get an answer grounded *only* in the
+constitutional text, with the sections it came from. Under that sits a real
+platform: an agentic retrieval pipeline, an API gateway with auth + rate
+limiting, per-request metrics in Postgres, asynchronous evaluation, MCP tools,
+Prometheus/Grafana, and dbt models over the logs — all wired together in one
+`docker compose up`.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
-### 1. Ingestion — `ingest.py`
+```mermaid
+flowchart LR
+    U[Client / browser] -->|X-API-Key| GW
 
-* **Load:** `PyPDFLoader` reads `constitution-of-the-federal-republic-of-nigeria.pdf`.
-* **Section tagging:** a regex tags every chunk with its `Section N` number so answers can cite specific sections.
-* **Chunking:** `RecursiveCharacterTextSplitter` — `chunk_size=800`, `chunk_overlap=150`, split on legal boundaries (`\nSection `, `\nPART `, …).
-* **Noise filter:** short Preamble fragments are dropped.
-* **Index:** chunks are embedded and written to a persistent **ChromaDB** store in `chroma_db/`.
-* `ingest.py` also builds a BM25 + `EnsembleRetriever`; the serving path now uses the same hybrid design (BM25 rebuilt at startup from the persisted Chroma docs) — see below.
+    subgraph gateway [Gateway  Django + DRF]
+      GW[API key auth + rate limit] --> AG
+      AG[LangGraph agent<br/>classify → retrieve → chain → verify] --> GEN[Generation<br/>openai | ollama]
+      GW -.audit + RequestMetrics.-> PG[(Postgres)]
+      GW -->|/metrics| PROM
+    end
 
-### 2. Retrieval agent + generation — `rag_engine/graph.py`, `rag_engine/services.py`
+    AG <-->|MCP streamable-http| MCP[MCP tool server<br/>lookup_section<br/>find_related_sections<br/>search_precedent]
+    AG --> CH[(ChromaDB<br/>vector + BM25)]
+    MCP --> CH
 
-Retrieval is a **LangGraph agent** (`classify → retrieve → chain → verify`); the
-generation step is unchanged. `query()` and `POST /api/chat/` keep their
-previous return / stream shape.
+    GW -->|enqueue after response| RQ[(Redis)]
+    RQ --> W[Celery worker<br/>evaluate_request_task]
+    W -->|eval_results| PG
+    W -->|/metrics :9540| PROM
 
-| node | what it does |
+    PROM[Prometheus] --> GRAF[Grafana<br/>provisioned dashboard]
+    PG --> DBT[dbt models<br/>volume · latency · eval trend]
+
+    GEN -.->|LLM_PROVIDER=ollama| OLL[Host Ollama<br/>outside Docker, GPU]
+    GEN -.->|LLM_PROVIDER=openai| API[Groq / OpenAI API]
+```
+
+| Service | Role |
 |---|---|
-| **classify** | one **cheap/fast** LLM call (`CLASSIFY_LLM_MODEL`, default `allam-2-7b` — *not* the generation model) labels the query `direct_lookup` / `cross_reference` / `interpretive`. Keyword heuristic fallback if the call fails. |
-| **retrieve** | `direct_lookup` + a section number → MCP `lookup_section` (direct metadata fetch, no semantic search); `interpretive` → MCP `search_precedent` (stub); otherwise in-process hybrid retrieval (`EnsembleRetriever` over ChromaDB vector + BM25). |
-| **chain** | for each primary section (cap 2) → MCP `find_related_sections`, which runs the shared section regex (`rag_engine/sections.py`) over that section's text and returns the cross-referenced sections. Falls back to in-process regex if the MCP client is down. |
-| **verify** | cheap deterministic self-check (no LLM) — is the retrieved text substantive enough for this question type? If not, **one** retry with a reformulated query (hard cap, no loop). |
+| **gateway** | Django + DRF. API-key auth (`X-API-Key` → `ApiKey` model), per-key rate limit (DRF throttle), audit-log middleware, the LangGraph retrieval agent, streaming NDJSON responses, `RequestMetric` written to Postgres per request, `/metrics` for Prometheus. |
+| **mcp** | Standalone MCP server (`mcp` SDK, streamable-http). Three tools the agent's retrieve/chain nodes call: `lookup_section`, `find_related_sections`, `search_precedent` (stub). Talks to ChromaDB directly. |
+| **chromadb** | Vector store. Populated on first boot from the constitution PDF (`AUTO_INGEST`). |
+| **postgres** | Audit log + `rag_request_metrics` + `eval_results`. One DB, joined on `request_id`. |
+| **redis** | Celery broker for the async evaluator. |
+| **worker** | Celery worker running `evaluate_request_task` — scores each request (keyword coverage, hit rate, MRR) *after* the response is sent. Own `/metrics` on :9540. |
+| **prometheus** | Scrapes `gateway:8000/metrics` + `worker:9540/metrics`. |
+| **grafana** | Auto-provisioned datasource + dashboard (latency by stage, tokens/sec by provider, tool-call breakdown, eval coverage, async-eval health). |
+| **dbt** (opt-in) | `dbt-postgres` models over the metrics tables (`--profile analytics`). |
 
-**MCP tool server** (`rag_engine/mcp_server.py`, official `mcp` SDK, stdio) exposes
-`lookup_section(number)`, `find_related_sections(section_id)`, and
-`search_precedent(query)` (stub — returns *"not yet implemented — case law
-integration planned"*). It reads ChromaDB directly via the `chromadb` client
-(no embeddings), so it starts fast. `RagService` holds **one** `McpToolClient`
-(`rag_engine/mcp_client.py`) — one subprocess + one session for the process
-lifetime; every tool call reuses the open pipes. If it can't start, the agent
-uses the in-process fallback and requests still work.
+**Request path:** `client → gateway (auth, rate limit) → LangGraph agent
+(classify → retrieve/chain via MCP → verify) → generation (streamed) →
+RequestMetric to Postgres → enqueue eval → response`. The eval runs later, in
+the worker, off the user's critical path.
 
-* **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`, local CPU, public model (no token).
-* **Generation LLM:** **Groq** `ChatGroq`, model from `GROQ_LLM_MODEL`, `temperature=0`. Ollama available as a commented alternative.
-* **Prompt:** answer only from retrieved context, otherwise say so.
+---
 
-### 3. API — `rag_engine/views.py`
+## Onboarding a new team
 
-`POST /api/chat/` with `{"query": "..."}` returns a **streamed** `application/x-ndjson`
-body — one JSON object per line:
+```bash
+git clone https://github.com/ogonkem/naija-civic-guard_AI_Platform.git
+cd naija-civic-guard_AI_Platform
 
-| line | shape |
+cp .env.example .env
+#   edit .env — at minimum:
+#     GROQ_API_KEY=...            (the "openai" provider path; OpenAI-compatible)
+#     DJANGO_SECRET_KEY=...       (python -c "from django.core.management.utils import get_random_secret_key as g; print(g())")
+#   optional:
+#     LLM_PROVIDER=ollama         (use a model on the host's Ollama instead)
+
+docker compose up --build          # brings up all 8 services; first boot ingests the PDF
+
+# mint an API key
+docker compose exec gateway python manage.py create_api_key --owner "my-team"
+
+# ask something
+curl -N -X POST localhost:8000/api/chat/ \
+  -H "X-API-Key: <key>" -H "Content-Type: application/json" \
+  -d '{"query":"What does Section 45 say about restrictions on fundamental rights?"}'
+```
+
+Then:
+- **Grafana** — <http://localhost:3000> (anon access, the *Naija Civic Guard – RAG* dashboard is pre-loaded)
+- **Prometheus** — <http://localhost:9090>
+- **Metrics** — <http://localhost:8000/metrics>, <http://localhost:9540/metrics>
+- **dbt models** — `docker compose --profile analytics run --rm dbt build`
+- **Browser chat** — <http://localhost:8000/> (auto-provisions its own key)
+
+Everything not in Docker: **Ollama** (wants direct GPU access on the host) and
+any **hosted LLM API** (Groq / OpenAI). Containers reach the host's Ollama via
+`host.docker.internal`.
+
+### Every env var
+
+See `.env.example` — it is the authoritative list, grouped by concern
+(Django, LLM provider, gateway, Postgres, Redis/Celery, ChromaDB, MCP,
+observability). Values docker-compose injects for the container network are
+marked "compose-set".
+
+---
+
+## What this closes
+
+Starting from a notebook-grade RAG script, this repo adds:
+
+- **A gateway, not a bare endpoint** — API-key identity, per-key rate limits, an audit log you can join to metrics by `request_id`.
+- **Observability that isn't `print`** — per-request latency broken out by pipeline stage, throughput, agent trace (classify label, retrieval calls, retries, MCP tool calls), all in Postgres *and* Prometheus, computed once and reused.
+- **Evaluation that doesn't block users** — every request is scored asynchronously (keyword coverage always; hit / MRR when the query is in the eval set), written to a separate table, with queue-depth and task-duration metrics so you can see eval falling behind.
+- **Retrieval as an agent, not one `similarity_search`** — a classify → retrieve → chain → verify graph that does direct section lookups, follows cross-references, and self-checks with one bounded retry.
+- **Tools as a service** — retrieval primitives extracted into an MCP server the agent calls over a reused connection, so they're independently testable and reusable.
+- **A provider switch** — `openai` vs `ollama` selectable per deploy, with the latency/throughput split visible in Grafana.
+- **Analytics over the logs** — dbt models for query volume, latency by provider/stage, and eval-score trend, ready for a warehouse.
+- **One command to stand it all up** — `docker compose up`, Prometheus scraping and the Grafana dashboard provisioned automatically.
+
+---
+
+## Limitations (honest)
+
+- **No jurisdiction handling.** It only knows the 1999 Constitution of the Federal Republic of Nigeria. It does not distinguish federal vs. state law, does not know about amendments beyond what's in the ingested PDF, and will confidently answer as if that one document is the whole of Nigerian law.
+- **No document versioning.** One PDF, one Chroma collection. There's no notion of "as of" a date, no diffing across constitutional amendments, no provenance beyond "which chunk".
+- **Retrieval precision is not at a production bar for legal use.** Section tagging is a coarse regex (roughly one section per PDF page), so `lookup_section` and the chain step can attach the wrong neighbouring section; the offline eval (`retrieval_eval.py`) shows hit rate well under what you'd want before anyone relies on an answer. Treat outputs as pointers to sections to read, not as legal advice.
+- **The LLM can still be wrong.** Grounding reduces fabrication; it doesn't eliminate it. `search_precedent` is a stub — there is no case-law integration.
+- **Single-node.** SQLite for local dev, one Postgres, one Redis, one gunicorn worker, LocMemCache throttling. Fine for a team; not a multi-region deployment.
+- **Auth is a shared secret.** API keys in a table, no rotation workflow, no per-endpoint scopes, no OAuth.
+
+---
+
+## Performance
+
+Real numbers from the `rag_request_metrics` Postgres table (this deployment's
+own logs), not estimates. Generation provider is selected by `LLM_PROVIDER`;
+there is **no "modal" provider in this project** — the two paths are `openai`
+(Groq's OpenAI-compatible API, model `openai/gpt-oss-20b`) and `ollama` (host
+Ollama, `llama3.2`).
+
+**Latency by stage** (`analytics.avg_latency_by_provider_and_stage`, 16 requests
+through the containerised stack — 10 `openai`, 6 `ollama`):
+
+| stage | openai — avg / p95 | ollama — avg / p95 |
+|---|---:|---:|
+| classify (cheap LLM) | 361 / 575 ms | 565 / 677 ms |
+| retrieval (MCP `lookup_section` + hybrid) | 41 / 58 ms | 41 / 57 ms |
+| chain (MCP `find_related_sections`) | 39 / 56 ms | 37 / 57 ms |
+| verify (heuristic) | 0.1 ms | 0.1 ms |
+| **generation** | **1160 / 1406 ms** | **22164 / 64677 ms** |
+| **total** | **1607 / 1926 ms** | **19869 / 62232 ms** |
+
+**Throughput** (`generation_tokens_per_second`): `openai` ≈ **349 tok/s**
+average; `ollama` (`llama3.2` on a CPU host) ≈ **8 tok/s** — and its first call
+paid a ~78 s cold model load, which is what pulls the p95 up.
+
+**Retrieval quality** (`analytics.eval_score_trend`, eval-set queries only) is
+provider-independent, as expected — `openai` hit-rate 0.71 / MRR 0.64 / keyword
+coverage 0.69; `ollama` 0.75 / 0.63 / 0.73.
+
+**Takeaway:** everything except generation is identical across providers
+(retrieval is ~41 ms either way); the provider choice is entirely a
+latency/throughput-vs-privacy trade on the generation step. Async eval adds
+**~26 ms of worker time** per request (`celery_eval_task_duration_seconds`) and
+lands in Postgres a few seconds *after* the response — visible in Grafana as
+the eval-coverage panel updating a step behind the latency panels.
+
+_Reproduce: run queries under each `LLM_PROVIDER`, then
+`docker compose --profile analytics run --rm dbt build` and read the
+`analytics.*` views._
+
+---
+
+## Repo layout
+
+| Path | What |
 |---|---|
-| metadata (first) | `{"type": "metadata", "sources": [...], "retrieved_contexts": [...]}` |
-| token (repeated) | `{"type": "token", "text": "..."}` |
-| done (last) | `{"type": "done", "duration": <s>, "timings_ms": {classify, retrieve, chain, verify, generation, total}, "agent": {classify_label, retrieval_calls, verify_retry}, ...}` |
-| error | `{"type": "error", "error": "..."}` |
+| `rag_engine/` | Django app: `views` (gateway), `graph` (LangGraph agent), `services` (LLM + retrieval), `mcp_server` / `mcp_client`, `metrics` / `metrics_prom`, `tasks` (Celery eval), `authentication` / `throttling` / `middleware`, `eval_core`, `sections` |
+| `civic_guard/` | Django project settings, `celery.py`, URLs (`/metrics`) |
+| `ingest.py` | PDF → chunk → tag → ChromaDB |
+| `retrieval_eval.py` | Offline eval → `eval_report.md` |
+| `dbt/` | `dbt-postgres` analytics models |
+| `docker/` | `gateway.Dockerfile`, `mcp.Dockerfile`, `dbt.Dockerfile`, `prometheus.yml`, `grafana/` provisioning + dashboard |
+| `docker-compose.yml` | The 8-service stack |
 
-The browser client (`static/js/chat.js` + `templates/chat.html`) renders tokens as
-they arrive.
+## Tests
 
-`RagService` is constructed once per process and **warmed at server boot**
-(`RagEngineConfig.ready()`) so the first request doesn't pay the model-load cost.
-Set `RAG_WARMUP=0` to skip the warm-up during fast dev restarts.
-
-#### Gateway (DRF) — API key + rate limit + audit log
-
-`POST /api/chat/` sits behind a DRF gateway (all in `rag_engine/`):
-
-* **Auth** — `ApiKeyAuthentication` (custom `BaseAuthentication`) checks the
-  `X-API-Key` header against the `ApiKey` model (`key`, `owner`, `is_active`,
-  `requests_per_minute`, `created_at`). Missing / unknown / inactive key →
-  **401**. Create keys with `python manage.py create_api_key --owner "<name>" [--rpm N]`
-  or in the Django admin — never by hand.
-* **Rate limit** — `ApiKeyRateThrottle` (DRF `SimpleRateThrottle`) keyed on the
-  API key, not a Django user. Default `api_key` rate is `60/min`
-  (`API_KEY_DEFAULT_RATE`); an `ApiKey.requests_per_minute` overrides it for
-  that key. Over the limit → **429**. (Throttle state is in Django's default
-  LocMemCache — per-process; use a shared cache for multi-worker gunicorn.)
-* **Audit log** — `AuditLogMiddleware` (plain Django middleware, last in the
-  chain) writes one `RequestAuditLog` row per `/api/` request via the ORM:
-  `api_key`, `api_key_owner`, `endpoint`, `method`, `status_code`, `timestamp`,
-  and `request_id`. The `request_id` is the `X-Request-ID` response header
-  `ChatView` sets from its `RequestMetrics`, so **audit log and metrics join on
-  `request_id`**. 401/429 never reach the agent → those rows have a null
-  `request_id` and no `RequestMetric`. Inspect via the admin or SQL.
-
-### 4. Request metrics — `rag_engine/metrics.py` + `RequestMetric` model
-
-Every `POST /api/chat/` builds a `RequestMetrics` dataclass at the start of the
-request, fills it in stage by stage (embedding → retrieval → generation), and
-writes **one row** to the `rag_request_metrics` table from a `finally` block —
-a single inline INSERT, so a row lands even if generation errors partway
-through (the exception text is stored in `error`).
-
-Columns: `request_id` (UUID, for joining async eval results back later),
-`timestamp`, `query_text`, `provider`, `model`, `retrieval_time_ms`,
-`generation_time_ms`, `total_time_ms`, `tokens_generated`
-(exact from the provider when available, else a whitespace-split estimate —
-`tokens_generated_is_estimate` flags which), `tokens_per_second`, `error`, plus
-the **retrieval-agent trace**: `classify_label`, `retrieval_calls` (> 1 once the
-chain node fires a follow-up retrieval), `verify_retry`, per-node latency
-`classify_ms` / `retrieve_ms` / `chain_ms` / `verify_ms`, and **`tool_calls`**
-— a nested JSON list of every MCP tool call the retrieve/chain nodes made
-(`{tool_name, tool_latency_ms, ok, error}`), on the same row.
-
-Inspect it:
-```
-python manage.py dump_metrics -n 20      # table of the last N
-python manage.py dump_metrics --errors   # only failed requests
-python manage.py dump_metrics --csv      # CSV, all fields
-```
-Also registered in the Django admin (`/admin/`), and it's a plain table —
-query it with SQL directly if you prefer.
-
-### 5. Async per-request evaluation — Celery + Redis
-
-After the response is fully streamed and the `RequestMetric` row is written,
-the gateway hands the request off to a **Celery task** (`evaluate_request_task`)
-— fire-and-forget, on a background thread, so the request path never touches
-Redis. Payload: `{request_id, query, retrieved_context, retrieved_section_ids,
-response_text}`.
-
-The task (`rag_engine/tasks.py`) scores the request with `rag_engine/eval_core.py`
-— the *same* helpers the offline `retrieval_eval.py` uses — and writes one row
-to the **`eval_results`** table:
-
-| field | always | notes |
-|---|---|---|
-| `request_id` | ✓ | joins back to `rag_request_metrics` |
-| `keyword_coverage`, `keyword_source` | ✓ | vs. ground-truth keywords, or (for a real off-set query) vs. keywords derived from the query |
-| `retrieved_section_ids`, `response_chars` | ✓ | |
-| `matched_ground_truth` | ✓ | whether the query is in `evaluation_set.jsonl` |
-| `hit`, `reciprocal_rank`, `target_section` | only with ground truth | stay `NULL` for real user queries |
-
-`eval_results` is a **separate table** joined on `request_id` — the request
-process and the eval worker never write the same row. If Redis or the worker
-is down the enqueue fails softly (logged, `WARNING`) and the request is
-unaffected; that request just never gets an `eval_results` row.
-
-Run the worker (needs Redis — see setup):
-```
-celery -A civic_guard worker -Q eval -l info --pool=solo   # --pool=solo on Windows
-```
-Inspect the join:
-```
-python manage.py dump_eval -n 20        # requests + their eval results
-python manage.py dump_eval --pending    # requests not yet evaluated
+```bash
+python manage.py test rag_engine        # unit + integration (SQLite, no external services)
+python retrieval_eval.py                # offline retrieval quality
 ```
 
-### 6. Offline evaluation — `retrieval_eval.py`
+## Disclaimer
 
-Runs `evaluation_set.jsonl` through `RagService.query()` (the non-streaming path)
-and writes `eval_report.md` with Hit Rate, Mean Reciprocal Rank and keyword
-coverage, plus a per-query breakdown. Shares its metric math with the async
-task via `rag_engine/eval_core.py`.
-
----
-
-## 📊 Benchmarks
-
-From the most recent `retrieval_eval.py` run recorded in `eval_report.md`:
-
-| Metric | Value |
-|---|---|
-| Hit Rate (target section retrieved) | 60% |
-| Mean Reciprocal Rank | 0.45 |
-| Avg keyword coverage | 84% |
-
-> These figures were recorded with an earlier retrieval configuration (`k = 10`).
-> Re-run `python retrieval_eval.py` to refresh them for the current `k = 5` setup.
-
----
-
-## 🛠️ Stack
-
-| Layer | Choice |
-|---|---|
-| Web framework | Django 6.x (Python 3.12) |
-| API | Django REST Framework — streaming NDJSON endpoint, behind an API-key + rate-limit + audit-log gateway |
-| Orchestration | LangChain + **LangGraph** (retrieval agent) |
-| LLM | Groq API (`ChatGroq`); Ollama supported as a commented alternative |
-| Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (local, CPU) |
-| Vector store | ChromaDB, persisted in `chroma_db/` |
-| Observability | LangSmith (optional, via env) |
-| Async eval | Celery 5 + Redis (broker **and** result backend) |
-| Serving | Gunicorn + Nginx via Docker Compose |
-| Static files | WhiteNoise |
-
----
-
-## 🚀 Setup
-
-1. **Install dependencies:**
-   ```
-   pip install -r requirements.txt
-   ```
-
-2. **Configure `.env`** — copy the template and fill it in:
-   ```
-   cp .env.example .env
-   ```
-   ```
-   # Django
-   DJANGO_SECRET_KEY=<generate one, see below>
-   DJANGO_DEBUG=true                     # set false in production
-   DJANGO_ALLOWED_HOSTS=                 # comma-separated hostnames in production
-
-   # LLM (required)
-   GROQ_API_KEY=your_groq_key
-   GROQ_LLM_MODEL=openai/gpt-oss-20b     # generation model; any your Groq key can access
-   CLASSIFY_LLM_MODEL=allam-2-7b         # cheap/fast model for the classify node only
-
-   # Observability (optional)
-   LANGSMITH_TRACING=false
-   LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com
-   LANGSMITH_API_KEY=your_langsmith_key
-   LANGSMITH_PROJECT=Naija-Civic-Guard
-
-   # Async evaluation (Celery) — broker + result backend
-   REDIS_URL=redis://localhost:6379/0
-   # CELERY_TASK_ALWAYS_EAGER=1          # run eval inline, no Redis/worker (dev only)
-
-   # Only needed if you switch the LLM to local Ollama
-   OLLAMA_BASE_URL=http://localhost:11434
-   ```
-   * Generate a secret key:
-     `python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"`.
-     If `DJANGO_SECRET_KEY` is unset the app falls back to an insecure dev key so
-     `runserver` still works. When `DEBUG` is on and `DJANGO_ALLOWED_HOSTS` is
-     empty, `localhost`/`127.0.0.1` are allowed automatically.
-   * `GROQ_LLM_MODEL` must be a model your key is allowed to use. Llama models
-     (e.g. `llama-3.1-8b-instant`) require a Groq key with Llama access;
-     `openai/gpt-oss-20b` is the tested default. List what your key can access:
-     `curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"`.
-   * No `HF_API_TOKEN` is needed — the embedding model is public.
-
-3. **Build the index** (writes `chroma_db/`; delete that folder first to rebuild):
-   ```
-   python ingest.py
-   ```
-
-4. **Run:**
-   ```
-   python manage.py migrate
-   python manage.py create_api_key --owner "me"      # gateway needs a key
-   python manage.py runserver
-   ```
-   Call the API with the key:
-   ```
-   curl -N -X POST localhost:8000/api/chat/ \
-     -H "X-API-Key: <key>" -H "Content-Type: application/json" \
-     -d '{"query":"What does Section 33 say?"}'
-   ```
-   (The browser chat page at `/` posts to the same endpoint and now needs the
-   key wired into `static/js/chat.js` — it will 401 as-is.)
-
-5. **Async evaluation worker** (optional — the app runs fine without it, you
-   just get no `eval_results` rows):
-   ```
-   docker run -d --name ncg-redis -p 6379:6379 redis:7-alpine
-   celery -A civic_guard worker -Q eval -l info --pool=solo
-   ```
-
-6. **Tests and evaluation:**
-   ```
-   python manage.py test rag_engine
-   python manage.py dump_metrics      # per-request latency / throughput
-   python manage.py dump_eval         # requests joined to async eval results
-   python retrieval_eval.py           # offline batch eval -> eval_report.md
-   ```
-
----
-
-## 🐳 Docker
-
-```
-docker-compose up --build
-```
-
-Brings up Gunicorn (`web`, with worker threads for the streaming responses) behind
-Nginx. Nginx proxies `/` with `proxy_buffering off` so the token stream is not held
-back; `.env` is passed through via `env_file`.
-
----
-
-## ⚖️ Disclaimer
-
-Naija Civic Guard is an AI-powered educational tool. While it is built on the
-official Nigerian Constitution, always verify legal findings against the Official
-Gazette or a legal professional.
+An AI-powered educational tool. Verify every legal finding against the Official
+Gazette or a qualified legal professional.
