@@ -14,19 +14,21 @@ from django.core.management.base import BaseCommand
 from rag_engine.models import RequestMetric
 
 COLUMNS = [
-    ("timestamp",    lambda r: r.timestamp.strftime("%Y-%m-%d %H:%M:%S"), 19),
+    ("timestamp",    lambda r: r.timestamp.strftime("%m-%d %H:%M:%S"),   14),
     ("request_id",   lambda r: str(r.request_id)[:8],                     8),
-    ("provider",     lambda r: r.provider or "-",                        7),
-    ("model",        lambda r: r.model or "-",                          20),
-    ("embed_ms",     lambda r: _num(r.embedding_time_ms),                9),
-    ("retr_ms",      lambda r: _num(r.retrieval_time_ms),               9),
-    ("gen_ms",       lambda r: _num(r.generation_time_ms),              10),
-    ("total_ms",     lambda r: _num(r.total_time_ms),                   10),
-    ("tokens",       lambda r: _int(r.tokens_generated),                 7),
-    ("est?",         lambda r: "y" if r.tokens_generated_is_estimate else "",  4),
-    ("tok/s",        lambda r: _num(r.tokens_per_second, 1),             7),
-    ("error",        lambda r: " ".join((r.error or "").split())[:32],  32),
-    ("query",        lambda r: " ".join(r.query_text.split())[:40],     40),
+    ("classify",     lambda r: r.classify_label or "-",                  15),
+    ("rcalls",       lambda r: _int(r.retrieval_calls),                   6),
+    ("retry",        lambda r: "y" if r.verify_retry else "",            5),
+    ("clsfy_ms",     lambda r: _num(r.classify_ms),                       9),
+    ("retr_ms",      lambda r: _num(r.retrieve_ms),                       9),
+    ("chain_ms",     lambda r: _num(r.chain_ms),                          9),
+    ("vrfy_ms",      lambda r: _num(r.verify_ms),                         9),
+    ("gen_ms",       lambda r: _num(r.generation_time_ms),               10),
+    ("total_ms",     lambda r: _num(r.total_time_ms),                    10),
+    ("tokens",       lambda r: _int(r.tokens_generated),                  7),
+    ("tok/s",        lambda r: _num(r.tokens_per_second, 1),              7),
+    ("error",        lambda r: " ".join((r.error or "").split())[:24],   24),
+    ("query",        lambda r: " ".join(r.query_text.split())[:36],      36),
 ]
 
 

@@ -31,10 +31,19 @@ class RequestMetrics:
     model: str = ""
 
     # All stage timings in milliseconds. None means "stage did not run".
-    embedding_time_ms: float | None = None      # query-vector embedding
-    retrieval_time_ms: float | None = None      # ChromaDB / hybrid search
+    embedding_time_ms: float | None = None      # query-vector embedding (agent folds this into retrieve_ms)
+    retrieval_time_ms: float | None = None      # kept for continuity == retrieve_ms
     generation_time_ms: float | None = None     # LLM call (streamed end-to-end)
     total_time_ms: float | None = None          # whole request, set in finally
+
+    # --- LangGraph retrieval agent (classify -> retrieve -> chain -> verify) ---
+    classify_label: str = ""                    # direct_lookup | cross_reference | interpretive
+    retrieval_calls: int | None = None          # total retrieve() calls; >1 when chaining fires
+    verify_retry: bool = False                  # did the verify node trigger its one reformulated retry
+    classify_ms: float | None = None            # per-node latency (cumulative if a node runs twice)
+    retrieve_ms: float | None = None
+    chain_ms: float | None = None
+    verify_ms: float | None = None
 
     tokens_generated: int | None = None
     # True when tokens_generated is a whitespace-split estimate because the
@@ -95,17 +104,25 @@ class RequestMetrics:
                 tokens_generated_is_estimate=self.tokens_generated_is_estimate,
                 tokens_per_second=self.tokens_per_second,
                 error=self.error or "",
+                classify_label=self.classify_label or "",
+                retrieval_calls=self.retrieval_calls,
+                verify_retry=self.verify_retry,
+                classify_ms=self.classify_ms,
+                retrieve_ms=self.retrieve_ms,
+                chain_ms=self.chain_ms,
+                verify_ms=self.verify_ms,
             )
         except Exception:
             logger.exception("Failed to persist RequestMetrics %s", self.request_id)
         else:
             logger.info(
-                "metrics request_id=%s provider=%s model=%s "
-                "embed_ms=%s retrieval_ms=%s generation_ms=%s total_ms=%s "
-                "tokens=%s tok_per_s=%s estimate=%s error=%s",
-                self.request_id, self.provider, self.model,
-                _fmt(self.embedding_time_ms), _fmt(self.retrieval_time_ms),
-                _fmt(self.generation_time_ms), _fmt(self.total_time_ms),
+                "metrics request_id=%s provider=%s model=%s classify=%s retrieval_calls=%s "
+                "verify_retry=%s classify_ms=%s retrieve_ms=%s chain_ms=%s verify_ms=%s "
+                "generation_ms=%s total_ms=%s tokens=%s tok_per_s=%s estimate=%s error=%s",
+                self.request_id, self.provider, self.model, self.classify_label,
+                self.retrieval_calls, self.verify_retry,
+                _fmt(self.classify_ms), _fmt(self.retrieve_ms), _fmt(self.chain_ms),
+                _fmt(self.verify_ms), _fmt(self.generation_time_ms), _fmt(self.total_time_ms),
                 self.tokens_generated, _fmt(self.tokens_per_second),
                 self.tokens_generated_is_estimate, bool(self.error),
             )

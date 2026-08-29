@@ -5,14 +5,94 @@ request-metrics row (Phase 2a), and the asynchronous evaluation task (Phase 2b).
 """
 import json
 
+from django.test import SimpleTestCase
 from django.urls import reverse
+from langchain_core.documents import Document
 from rest_framework import status
 from rest_framework.test import APITestCase
 from unittest.mock import patch
 
 from rag_engine.eval_core import evaluate_retrieval
+from rag_engine.graph import build_agent_graph, run_agent
 from rag_engine.models import EvalResult, RequestMetric
+from rag_engine.sections import find_section_references
 from rag_engine.tasks import evaluate_request_task
+
+
+class _FakeService:
+    """Stand-in for RagService: no LLM, no ChromaDB - just scripted behaviour
+    so the LangGraph agent can be exercised deterministically."""
+
+    def __init__(self, corpus, classify="direct_lookup", verify_script=None):
+        # corpus: {section_label: page_content}
+        self.corpus = corpus
+        self._classify = classify
+        # verify_script: list of (adequate, reformulated) returned in order
+        self._verify_script = list(verify_script or [(True, None)])
+        self.calls = []
+
+    def classify_query(self, query):
+        self.calls.append(("classify", query))
+        return self._classify
+
+    def retrieve(self, query):
+        self.calls.append(("retrieve", query))
+        # crude: return the doc whose label is named in the query, else the first
+        for label, text in self.corpus.items():
+            if label.lower() in query.lower() or label.split()[-1] in query:
+                return [Document(page_content=text, metadata={"section": label})]
+        first = next(iter(self.corpus.items()))
+        return [Document(page_content=first[1], metadata={"section": first[0]})]
+
+    def verify_retrieval(self, query, label, text):
+        self.calls.append(("verify", query))
+        return self._verify_script.pop(0) if self._verify_script else (True, None)
+
+
+class SectionReferenceTests(SimpleTestCase):
+    def test_enumeration_is_expanded_and_excluded(self):
+        text = "Nothing in sections 37, 38, 39, 40 and 41 of this Constitution shall invalidate..."
+        refs = find_section_references(text, exclude={"Section 45"})
+        self.assertEqual(refs, ["Section 37", "Section 38", "Section 39", "Section 40", "Section 41"])
+
+    def test_single_reference_and_out_of_range_dropped(self):
+        text = "in accordance with section 143 of this Constitution and section 999"
+        self.assertEqual(find_section_references(text), ["Section 143"])
+
+
+class RetrievalAgentTests(SimpleTestCase):
+    def test_chain_node_fires_second_retrieval_on_reference(self):
+        svc = _FakeService(corpus={
+            "Section 45": "Nothing in sections 37, 38 of this Constitution shall invalidate any law...",
+            "Section 37": "The privacy of citizens is guaranteed.",
+            "Section 38": "Every person is entitled to freedom of thought and religion.",
+        })
+        state = run_agent(build_agent_graph(svc), "What does Section 45 say?")
+
+        self.assertGreater(state["retrieval_calls"], 1)                 # chaining fired
+        self.assertIn("Section 37", state["chained_sections"])
+        self.assertIn("Section 38", state["chained_sections"])
+        self.assertIn("Section 37", state["sources"])
+        for k in ("classify_ms", "retrieve_ms", "chain_ms", "verify_ms"):
+            self.assertIsNotNone(state[k])
+        self.assertFalse(state.get("verify_retry"))
+
+    def test_verify_triggers_exactly_one_retry(self):
+        svc = _FakeService(
+            corpus={"Section 1": "The Constitution is supreme."},
+            verify_script=[(False, "supremacy of the constitution"), (False, "again"), (False, "again")],
+        )
+        state = run_agent(build_agent_graph(svc), "Is the constitution supreme?")
+
+        self.assertTrue(state["verify_retry"])
+        self.assertEqual(state["retry_count"], 1)          # capped at 1, no infinite loop
+        self.assertEqual(sum(1 for c in svc.calls if c[0] == "retrieve"), 2)
+
+    def test_no_reference_means_single_retrieval(self):
+        svc = _FakeService(corpus={"Section 33": "Every person has a right to life."})
+        state = run_agent(build_agent_graph(svc), "What does Section 33 say?")
+        self.assertEqual(state["retrieval_calls"], 1)
+        self.assertEqual(state["chained_sections"], [])
 
 
 class ChatViewTestCase(APITestCase):

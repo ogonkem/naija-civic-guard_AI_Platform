@@ -26,6 +26,15 @@ class RequestMetric(models.Model):
     tokens_generated_is_estimate = models.BooleanField(default=False)
     tokens_per_second = models.FloatField(null=True, blank=True)
 
+    # LangGraph retrieval agent (classify -> retrieve -> chain -> verify)
+    classify_label = models.CharField(max_length=32, blank=True, default="", db_index=True)
+    retrieval_calls = models.IntegerField(null=True, blank=True)  # >1 once chaining fires
+    verify_retry = models.BooleanField(default=False)
+    classify_ms = models.FloatField(null=True, blank=True)
+    retrieve_ms = models.FloatField(null=True, blank=True)
+    chain_ms = models.FloatField(null=True, blank=True)
+    verify_ms = models.FloatField(null=True, blank=True)
+
     error = models.TextField(blank=True, default="")
 
     class Meta:

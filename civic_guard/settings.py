@@ -153,6 +153,22 @@ STORAGE = {
 }
 
 
+# --- Logging: surface the rag_engine per-request / agent trace on the console
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "plain"}},
+    "loggers": {
+        "rag_engine": {
+            "handlers": ["console"],
+            "level": os.getenv("RAG_LOG_LEVEL", "INFO"),
+            "propagate": False,
+        },
+    },
+}
+
+
 # --- Celery (async RAG evaluation only) ---------------------------------------
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html
 _REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")

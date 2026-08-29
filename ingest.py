@@ -28,6 +28,8 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 
+from rag_engine.sections import SECTION_TAG_PATTERN
+
 # Set up logging for professional tracking
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ class ConstitutionIngestor:
     def __init__(self, file_path: str, db_dir: str = "./chroma_db"):
         self.file_path = file_path
         self.db_dir = db_dir
-        self.section_pattern = re.compile(r"(?:Section\s+)?(\d+)\.", re.IGNORECASE)
+        # Shared with the LangGraph chain node (rag_engine/sections.py).
+        self.section_pattern = SECTION_TAG_PATTERN
         
         load_dotenv(override=True)
         hf_api_token = os.getenv('HF_API_TOKEN')

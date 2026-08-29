@@ -19,14 +19,24 @@ answer.
 * **Chunking:** `RecursiveCharacterTextSplitter` — `chunk_size=800`, `chunk_overlap=150`, split on legal boundaries (`\nSection `, `\nPART `, …).
 * **Noise filter:** short Preamble fragments are dropped.
 * **Index:** chunks are embedded and written to a persistent **ChromaDB** store in `chroma_db/`.
-* `ingest.py` also builds an in-memory BM25 + `EnsembleRetriever` for experimentation. **The running app does not use it** — serving is pure vector search (see below).
+* `ingest.py` also builds a BM25 + `EnsembleRetriever`; the serving path now uses the same hybrid design (BM25 rebuilt at startup from the persisted Chroma docs) — see below.
 
-### 2. Retrieval + generation — `rag_engine/services.py`
+### 2. Retrieval agent + generation — `rag_engine/graph.py`, `rag_engine/services.py`
 
-* **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`, run locally on CPU via `langchain-huggingface`. The model is public — no HuggingFace token required.
-* **Vector store:** the persisted ChromaDB collection, queried as a retriever with **`k = 5`** (`RagService.RETRIEVAL_K`).
-* **LLM:** **Groq** via `langchain-groq` (`ChatGroq`), model from `GROQ_LLM_MODEL`, `temperature=0`. Ollama is still present in the code as a commented alternative — swap in `ChatOllama` + `OLLAMA_BASE_URL` to use a local model instead.
-* **Prompt:** a system prompt instructs the model to answer only from the retrieved context and to say it doesn't know otherwise.
+Retrieval is a **LangGraph agent** (`classify → retrieve → chain → verify`); the
+generation step is unchanged. `query()` and `POST /api/chat/` keep their
+previous return / stream shape.
+
+| node | what it does |
+|---|---|
+| **classify** | one **cheap/fast** LLM call (`CLASSIFY_LLM_MODEL`, default `allam-2-7b` — *not* the generation model) labels the query `direct_lookup` / `cross_reference` / `interpretive`. Keyword heuristic fallback if the call fails. |
+| **retrieve** | hybrid retrieval — `EnsembleRetriever` over ChromaDB vector search + BM25 (BM25 reconstructed at boot from the Chroma collection). |
+| **chain** | scans the retrieved text with the shared section regex (`rag_engine/sections.py`, same logic `ingest.py` tags with); for each referenced section not already retrieved (cap 2) it fires an extra targeted retrieval and folds the result in. |
+| **verify** | cheap deterministic self-check (no LLM) — is the retrieved text substantive enough for this question type? If not, **one** retry with a reformulated query (hard cap, no loop). |
+
+* **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`, local CPU, public model (no token).
+* **Generation LLM:** **Groq** `ChatGroq`, model from `GROQ_LLM_MODEL`, `temperature=0`. Ollama available as a commented alternative.
+* **Prompt:** answer only from retrieved context, otherwise say so.
 
 ### 3. API — `rag_engine/views.py`
 
@@ -37,7 +47,7 @@ body — one JSON object per line:
 |---|---|
 | metadata (first) | `{"type": "metadata", "sources": [...], "retrieved_contexts": [...]}` |
 | token (repeated) | `{"type": "token", "text": "..."}` |
-| done (last) | `{"type": "done", "duration": <seconds>}` |
+| done (last) | `{"type": "done", "duration": <s>, "timings_ms": {classify, retrieve, chain, verify, generation, total}, "agent": {classify_label, retrieval_calls, verify_retry}, ...}` |
 | error | `{"type": "error", "error": "..."}` |
 
 The browser client (`static/js/chat.js` + `templates/chat.html`) renders tokens as
@@ -56,10 +66,13 @@ a single inline INSERT, so a row lands even if generation errors partway
 through (the exception text is stored in `error`).
 
 Columns: `request_id` (UUID, for joining async eval results back later),
-`timestamp`, `query_text`, `provider`, `model`, `embedding_time_ms`,
-`retrieval_time_ms`, `generation_time_ms`, `total_time_ms`, `tokens_generated`
+`timestamp`, `query_text`, `provider`, `model`, `retrieval_time_ms`,
+`generation_time_ms`, `total_time_ms`, `tokens_generated`
 (exact from the provider when available, else a whitespace-split estimate —
-`tokens_generated_is_estimate` flags which), `tokens_per_second`, `error`.
+`tokens_generated_is_estimate` flags which), `tokens_per_second`, `error`, plus
+the **retrieval-agent trace**: `classify_label`, `retrieval_calls` (> 1 once the
+chain node fires a follow-up retrieval), `verify_retry`, and per-node latency
+`classify_ms` / `retrieve_ms` / `chain_ms` / `verify_ms`.
 
 Inspect it:
 ```
@@ -135,7 +148,7 @@ From the most recent `retrieval_eval.py` run recorded in `eval_report.md`:
 |---|---|
 | Web framework | Django 6.x (Python 3.12) |
 | API | Django REST Framework — streaming NDJSON endpoint |
-| Orchestration | LangChain (`langchain-core`, `langchain-chroma`, `langchain-huggingface`, `langchain-groq`) |
+| Orchestration | LangChain + **LangGraph** (retrieval agent) |
 | LLM | Groq API (`ChatGroq`); Ollama supported as a commented alternative |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (local, CPU) |
 | Vector store | ChromaDB, persisted in `chroma_db/` |
@@ -165,7 +178,8 @@ From the most recent `retrieval_eval.py` run recorded in `eval_report.md`:
 
    # LLM (required)
    GROQ_API_KEY=your_groq_key
-   GROQ_LLM_MODEL=openai/gpt-oss-20b     # any model your Groq key can access
+   GROQ_LLM_MODEL=openai/gpt-oss-20b     # generation model; any your Groq key can access
+   CLASSIFY_LLM_MODEL=allam-2-7b         # cheap/fast model for the classify node only
 
    # Observability (optional)
    LANGSMITH_TRACING=false

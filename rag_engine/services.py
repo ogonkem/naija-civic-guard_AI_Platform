@@ -1,56 +1,58 @@
-"""
-This module defines the RagService class, which encapsulates the logic for querying the RAG system.
-The RagService class initializes the necessary components for retrieval and generation, including:
-1. Embeddings: Uses the same HuggingFace model as the ingest phase to ensure consistency.
-2. Vector Store: Loads the existing ChromaDB vector store created during ingestion.
-3. Language Model: Initializes the Ollama chat model for generating responses.  
-4. Custom Prompt: Defines a system prompt to guide the LLM in providing accurate and context-aware answers based on the retrieved sections.
-The query method takes a user query, retrieves relevant sections from the vector store, and generates a response using the LLM. It also extracts and returns the source sections for transparency.
-Make sure to have the ChromaDB vector store set up and the Ollama model running before using this service.
+"""RagService: retrieval + generation for the Nigerian Constitution RAG.
+
+Retrieval is a LangGraph agent (see rag_engine/graph.py):
+    classify -> retrieve (hybrid: ChromaDB vector + BM25) -> chain -> verify
+Generation (streaming the answer over the retrieved context) is unchanged and
+still lives here. The public methods - query() and query_stream() - keep the
+same return / stream shape they had before the agent was introduced.
 """
 
 import logging
 import os
 import json
 import time
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
 from langchain_groq import ChatGroq
 
 from .metrics import RequestMetrics
+from .graph import build_agent_graph, run_agent, CLASSES
 
 logger = logging.getLogger(__name__)
 OLLAMA_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+
 class RagService:
     """Service class for handling RAG queries against the Nigerian Constitution."""
 
-    # Number of chunks pulled from the vector store per query. A smaller prompt
-    # means faster time-to-first-token and less chance of tripping Groq's
-    # free-tier token-rate limit (whose retry/backoff is a big source of lag).
-    RETRIEVAL_K = 5
+    RETRIEVAL_K = 5          # docs surfaced by the primary retrieve node
+    _BM25_K = 3              # per-retriever k inside the hybrid ensemble
+    _VECTOR_K = 3
 
     def __init__(self):
-        # 1. Embeddings (must match the model used during ingestion).
-        # all-MiniLM-L6-v2 is a public model, so we intentionally do NOT call
-        # huggingface_hub.login() here - it added a blocking network round-trip
-        # to every process start for no benefit.
+        # 1. Embeddings (must match the model used during ingestion). Public
+        # model - no huggingface_hub.login().
         self.embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-        # 2. Load the existing vector store and build the retriever ONCE, up
-        # front. Previously the retriever (and a whole RetrievalQA chain) was
-        # rebuilt on every request.
+        # 2. Vector store + hybrid retriever (ChromaDB semantic + BM25 keyword),
+        # matching ingest.py's EnsembleRetriever design. BM25 isn't persisted,
+        # so it's rebuilt here from the documents already in the Chroma store.
         self.vectorstore = Chroma(
             persist_directory="chroma_db",
             embedding_function=self.embeddings,
         )
-        self.retriever = self.vectorstore.as_retriever(
-            search_kwargs={"k": self.RETRIEVAL_K}
+        self._vector_retriever = self.vectorstore.as_retriever(
+            search_kwargs={"k": self._VECTOR_K}
         )
+        self._hybrid = self._build_hybrid_retriever()
 
-        # 3. LLM. Groq is a fast hosted endpoint; Ollama kept for reference.
+        # 3a. Generation LLM (the "main" model).
         # self.llm = ChatOllama(model="llama3", temperature=0, base_url=OLLAMA_URL)
         self.llm = ChatGroq(
             model=os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant"),
@@ -58,8 +60,15 @@ class RagService:
             timeout=30,
             max_retries=2,
         )
+        # 3b. Cheap/fast LLM used ONLY for the classify + verify nodes - never
+        # for generation. Override with CLASSIFY_LLM_MODEL.
+        self.classify_llm = ChatGroq(
+            model=os.getenv("CLASSIFY_LLM_MODEL", "allam-2-7b"),
+            temperature=0,
+            timeout=15,
+            max_retries=1,
+        )
 
-        # Provider / model labels recorded on every RequestMetrics row.
         if isinstance(self.llm, ChatGroq):
             self.llm_provider = "groq"
         elif isinstance(self.llm, ChatOllama):
@@ -69,8 +78,12 @@ class RagService:
         self.llm_model = (
             getattr(self.llm, "model_name", None) or getattr(self.llm, "model", "") or ""
         )
+        self.classify_model = (
+            getattr(self.classify_llm, "model_name", None)
+            or getattr(self.classify_llm, "model", "") or ""
+        )
 
-        # 4. Custom System Prompt for Legal Precision
+        # 4. Generation prompt.
         template = """You are a legal expert on the Nigerian Constitution.
         Use the following pieces of retrieved context to answer the question.
         If the answer isn't in the context, say you don't know—do not make up laws.
@@ -81,20 +94,141 @@ class RagService:
         Answer:"""
         self.QA_PROMPT = PromptTemplate.from_template(template)
 
-        # 5. Warm up the embedding model so the first real user query doesn't
-        # pay the one-time torch / model-load cost.
+        # 5. Compile the retrieval graph (bound to this service).
+        self._graph = build_agent_graph(self)
+
+        # 6. Warm up the embedding model so the first real request doesn't pay
+        # the one-time torch / model-load cost.
         try:
             self.embeddings.embed_query("warmup")
         except Exception as exc:  # best-effort only
             logger.warning(f"Embedding warmup failed: {exc}")
 
-    def query(self, user_query: str):
-        """Retrieve relevant sections and generate an answer (non-streaming).
-
-        Kept for the evaluation suite; the live endpoint uses query_stream().
-        """
+    # ------------------------------------------------------------------ #
+    # Retrieval primitives used by the graph nodes                        #
+    # ------------------------------------------------------------------ #
+    def _build_hybrid_retriever(self):
         try:
-            docs = self.retriever.invoke(user_query)
+            raw = self.vectorstore.get(include=["documents", "metadatas"])
+            docs = [
+                Document(page_content=c, metadata=m or {})
+                for c, m in zip(raw["documents"], raw["metadatas"])
+                if c
+            ]
+            if not docs:
+                raise ValueError("Chroma collection is empty")
+            bm25 = BM25Retriever.from_documents(docs)
+            bm25.k = self._BM25_K
+            hybrid = EnsembleRetriever(
+                retrievers=[bm25, self._vector_retriever],
+                weights=[0.4, 0.6],  # lean semantic, keep keyword recall
+            )
+            logger.info("Hybrid retriever ready (BM25 over %d chunks + Chroma vector).", len(docs))
+            return hybrid
+        except Exception as exc:
+            logger.warning("Hybrid retriever unavailable, using vector-only: %s", exc)
+            return None
+
+    def retrieve(self, query: str):
+        """Hybrid retrieval (BM25 + vector). Falls back to vector-only.
+
+        This is the "existing hybrid retrieval, unchanged" that the graph's
+        retrieve and chain nodes call.
+        """
+        if self._hybrid is not None:
+            docs = self._hybrid.invoke(query)
+        else:
+            vec = self.embeddings.embed_query(query)
+            docs = self.vectorstore.similarity_search_by_vector(vec, k=self.RETRIEVAL_K)
+        return docs[: self.RETRIEVAL_K + 3]  # small headroom for the ensemble fusion
+
+    # ------------------------------------------------------------------ #
+    # Cheap-LLM nodes: classify + verify                                  #
+    # ------------------------------------------------------------------ #
+    def classify_query(self, query: str) -> str:
+        prompt = (
+            "Classify this question about the Nigerian Constitution into exactly one label.\n"
+            "- direct_lookup: asks what a specific section or article says\n"
+            "- cross_reference: asks which sections relate to a topic, or how sections connect\n"
+            "- interpretive: asks for interpretation, implication, or real-world application\n\n"
+            f"Question: {query}\n"
+            "Answer with only the label."
+        )
+        try:
+            resp = (self.classify_llm.invoke(prompt).content or "").strip().lower()
+            for label in CLASSES:
+                if label in resp or label.replace("_", " ") in resp:
+                    return label
+        except Exception as exc:
+            logger.warning("classify LLM failed (%s); using heuristic", exc)
+        return self._classify_heuristic(query)
+
+    @staticmethod
+    def _classify_heuristic(query: str) -> str:
+        q = (query or "").lower()
+        if any(w in q for w in ("relate", "related", "connect", "cross-reference",
+                                "cross reference", "which sections", "what sections",
+                                "list the sections")):
+            return "cross_reference"
+        if any(w in q for w in ("mean", "interpret", "imply", "implication", "apply",
+                                "application", "can the government", "is it legal",
+                                "does it allow", "how does")):
+            return "interpretive"
+        return "direct_lookup"
+
+    def verify_retrieval(self, query: str, label: str, retrieved_text: str):
+        """Lightweight self-check: does the retrieved text plausibly answer a
+        question of this type? Returns (adequate: bool, reformulated: str|None).
+
+        Deliberately a cheap heuristic - no LLM call, deterministic, ~0ms - so
+        the one allowed retry only fires when retrieval genuinely came back thin.
+        """
+        import re as _re
+
+        text = (retrieved_text or "")
+        low = text.lower()
+
+        if label == "cross_reference":
+            distinct = len(_re.findall(r"section\s+\d+", low))
+            adequate = distinct >= 2 and len(text) > 300
+        elif label == "interpretive":
+            adequate = len(text) > 400
+        else:  # direct_lookup
+            nums = _re.findall(r"\d{1,3}", query)
+            has_section_text = "section" in low or bool(_re.search(r"\b\d{1,3}\.\s", text))
+            num_present = (not nums) or any(f"section {n}" in low or f"{n}." in text for n in nums)
+            adequate = len(text) > 200 and has_section_text and num_present
+
+        if adequate:
+            return True, None
+        return False, f"{query} — full text of the relevant Nigerian Constitution section"
+
+    # ------------------------------------------------------------------ #
+    # Graph driver                                                        #
+    # ------------------------------------------------------------------ #
+    def run_retrieval_agent(self, user_query: str, metrics: "RequestMetrics | None" = None):
+        """Run classify -> retrieve -> chain -> verify; copy trace onto metrics."""
+        state = run_agent(self._graph, user_query)
+        if metrics is not None:
+            metrics.classify_label = state.get("classification") or ""
+            metrics.retrieval_calls = state.get("retrieval_calls")
+            metrics.verify_retry = bool(state.get("verify_retry"))
+            metrics.classify_ms = state.get("classify_ms")
+            metrics.retrieve_ms = state.get("retrieve_ms")
+            metrics.chain_ms = state.get("chain_ms")
+            metrics.verify_ms = state.get("verify_ms")
+            # Keep the Phase 2 field meaningful: retrieval_time_ms == retrieve node.
+            metrics.retrieval_time_ms = state.get("retrieve_ms")
+        return state
+
+    # ------------------------------------------------------------------ #
+    # Public API (unchanged shape)                                        #
+    # ------------------------------------------------------------------ #
+    def query(self, user_query: str):
+        """Retrieve (via the agent) and generate an answer (non-streaming)."""
+        try:
+            state = self.run_retrieval_agent(user_query)
+            docs = state["docs"]
 
             context_text = "\n\n".join(doc.page_content for doc in docs)
             prompt = self.QA_PROMPT.format(context=context_text, question=user_query)
@@ -104,57 +238,48 @@ class RagService:
             return {
                 "answer": answer,
                 "sources": list(set(sources)),
-                "source_documents": docs,                                  # for the evaluator
-                "retrieved_contexts": [doc.page_content for doc in docs],  # for the evaluator
+                "source_documents": docs,
+                "retrieved_contexts": [doc.page_content for doc in docs],
+                "classification": state.get("classification"),
             }
         except Exception as e:
             logger.error(f"RAG Query Error: {e}")
             return {"error": str(e)}
-        
+
     def query_stream(self, user_query: str, metrics: "RequestMetrics | None" = None):
         """Stream the answer token-by-token, metadata JSON line first.
 
-        When ``metrics`` is provided, per-stage timings and the output token
-        count are recorded on it. This method never persists metrics - the
-        caller does that once, in a finally block.
+        Same stream shape as before: one metadata line, then token lines. The
+        retrieval stage is now the LangGraph agent; generation is unchanged.
         """
         try:
-            # --- Stage 1: embed the query --------------------------------------
-            t0 = time.perf_counter()
-            query_vec = self.embeddings.embed_query(user_query)
+            # --- Agentic retrieval: classify -> retrieve -> chain -> verify ---
+            state = self.run_retrieval_agent(user_query, metrics=metrics)
+            docs = state["docs"]
+            sources = state.get("sources") or list(
+                {d.metadata.get("section") for d in docs}
+            )
+            retrieved_contexts = [d.page_content for d in docs]
             if metrics is not None:
-                metrics.embedding_time_ms = (time.perf_counter() - t0) * 1000.0
-
-            # --- Stage 2: vector search (ChromaDB) ---------------------------
-            t0 = time.perf_counter()
-            docs = self.vectorstore.similarity_search_by_vector(query_vec, k=self.RETRIEVAL_K)
-            if metrics is not None:
-                metrics.retrieval_time_ms = (time.perf_counter() - t0) * 1000.0
-
-            sources = list(set(doc.metadata.get("section") for doc in docs))
-            retrieved_contexts = [doc.page_content for doc in docs]
-            if metrics is not None:
-                # Stashed for the async evaluator hand-off (not persisted here).
                 metrics.retrieved_section_ids = sources
                 metrics.retrieved_contexts = retrieved_contexts
+
             yield json.dumps({
                 "type": "metadata",
                 "sources": sources,
                 "retrieved_contexts": retrieved_contexts,
             }) + "\n"
 
-            context_text = "\n\n".join(doc.page_content for doc in docs)
+            context_text = "\n\n".join(retrieved_contexts)
             formatted_prompt = self.QA_PROMPT.format(context=context_text, question=user_query)
 
-            # --- Stage 3: LLM generation (streamed) --------------------------
+            # --- Generation (streamed) - unchanged ---
             t0 = time.perf_counter()
             parts = []
             exact_output_tokens = None
             for chunk in self.llm.stream(formatted_prompt):
                 parts.append(chunk.content)
                 yield json.dumps({"type": "token", "text": chunk.content}) + "\n"
-                # Groq (and others) attach an exact usage count on the final
-                # chunk; prefer it over the whitespace estimate when present.
                 usage = getattr(chunk, "usage_metadata", None) or {}
                 if usage.get("output_tokens"):
                     exact_output_tokens = usage["output_tokens"]
@@ -169,5 +294,3 @@ class RagService:
             if metrics is not None:
                 metrics.error = f"{type(e).__name__}: {e}"
             yield json.dumps({"type": "error", "error": str(e)}) + "\n"
-        
-
