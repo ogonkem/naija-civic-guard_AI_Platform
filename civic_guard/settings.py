@@ -160,11 +160,16 @@ STATICFILES_DIRS = [
     BASE_DIR / 'static'
 ]
 
-# enable compression and optimal client cache headers
-STORAGE = {
+# Django 4.2+ setting is STORAGES (plural). Was misnamed STORAGE, so WhiteNoise's
+# hashed-manifest + gzip/brotli storage was never active. Run `collectstatic`
+# after changing static assets - the manifest is what {% static %} resolves.
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
     "staticfiles": {
         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
-    }
+    },
 }
 
 

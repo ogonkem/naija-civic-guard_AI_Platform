@@ -12,7 +12,7 @@ db.sqlite3
 db.sqlite3
 # media/
 # static/
-# staticfiles/
+staticfiles/          # collectstatic output - regenerated on deploy (entrypoint.sh)
 .python-version
 
 # --- RAG & Vector Database ---
