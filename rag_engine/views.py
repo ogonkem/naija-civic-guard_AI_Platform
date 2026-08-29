@@ -6,10 +6,13 @@ from concurrent.futures import ThreadPoolExecutor
 from django.http import StreamingHttpResponse
 from django.shortcuts import render
 from rest_framework import status
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .authentication import ApiKeyAuthentication
 from .metrics import RequestMetrics
+from .throttling import ApiKeyRateThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -36,14 +39,16 @@ def chat_page(request):
 class ChatView(APIView):
     """Streams RAG answers as newline-delimited JSON.
 
-    Emits one ``{"type": "metadata", ...}`` line, then ``{"type": "token"}``
-    lines as the LLM generates, then a final ``{"type": "done", ...}`` line
-    carrying the per-stage latency breakdown.
-
-    Every request is measured by a ``RequestMetrics`` created up front and
-    written exactly once from the ``finally`` block below - a single inline
-    INSERT, so a row lands even if generation errors partway through.
+    Gateway: X-API-Key auth (401 if missing/invalid) + per-key rate limit
+    (429 over the limit). Past those, behaviour is unchanged - one metadata
+    line, token lines, a final ``done`` line, and a RequestMetrics row.
+    ``X-Request-ID`` response header carries the metrics request_id so the
+    audit-log middleware can join the two.
     """
+
+    authentication_classes = [ApiKeyAuthentication]
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [ApiKeyRateThrottle]
 
     def post(self, request):
         user_query = request.data.get("query")
@@ -110,6 +115,8 @@ class ChatView(APIView):
         # Defeat proxy/browser buffering so tokens arrive as they are produced.
         response["X-Accel-Buffering"] = "no"
         response["Cache-Control"] = "no-cache"
+        # Join key for the audit-log middleware <-> RequestMetrics row.
+        response["X-Request-ID"] = metrics.request_id
         return response
 
 

@@ -5,6 +5,7 @@ request-metrics row (Phase 2a), and the asynchronous evaluation task (Phase 2b).
 """
 import json
 
+from django.core.cache import cache
 from django.test import SimpleTestCase
 from django.urls import reverse
 from langchain_core.documents import Document
@@ -14,9 +15,20 @@ from unittest.mock import patch
 
 from rag_engine.eval_core import evaluate_retrieval
 from rag_engine.graph import build_agent_graph, run_agent
-from rag_engine.models import EvalResult, RequestMetric
+from rag_engine.models import ApiKey, EvalResult, RequestAuditLog, RequestMetric
 from rag_engine.sections import find_section_references
 from rag_engine.tasks import evaluate_request_task
+
+
+def _fake_stream_service(mock_get_service):
+    fake = mock_get_service.return_value
+    fake.llm_provider = "groq"
+    fake.llm_model = "openai/gpt-oss-20b"
+    fake.query_stream.return_value = iter([
+        '{"type": "metadata", "sources": ["Section 14"]}\n',
+        '{"type": "token", "text": "one two three"}\n',
+    ])
+    return fake
 
 
 class _FakeService:
@@ -96,10 +108,13 @@ class RetrievalAgentTests(SimpleTestCase):
 
 
 class ChatViewTestCase(APITestCase):
-    """The streaming endpoint + the synchronous metrics row."""
+    """The streaming endpoint + the synchronous metrics row (authenticated)."""
 
     def setUp(self):
         self.url = reverse('chat')
+        cache.clear()  # DRF throttle state lives in the cache
+        self.api_key = ApiKey.objects.create(owner="test-suite")
+        self.client.credentials(HTTP_X_API_KEY=self.api_key.key)
         # The endpoint enqueues an async eval task in its finally block; that
         # hand-off is exercised separately below. Stub it here so these tests
         # never touch a broker.
@@ -254,3 +269,86 @@ class AsyncEvalTestCase(APITestCase):
              "keywords_checked", "target_section", "hit", "reciprocal_rank",
              "retrieved_section_ids", "response_chars"},
         )
+
+
+class GatewayTestCase(APITestCase):
+    """API-key auth (401), per-key rate limit (429), audit-log join."""
+
+    def setUp(self):
+        self.url = reverse("chat")
+        cache.clear()
+        p = patch("rag_engine.views._enqueue_eval")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _post(self, **kwargs):
+        return self.client.post(self.url, {"query": "right to life"}, format="json", **kwargs)
+
+    # --- auth --------------------------------------------------------------- #
+    def test_no_api_key_returns_401(self):
+        resp = self._post()
+        self.assertEqual(resp.status_code, 401)
+
+    def test_invalid_api_key_returns_401(self):
+        self.client.credentials(HTTP_X_API_KEY="ncg_not_a_real_key")
+        self.assertEqual(self._post().status_code, 401)
+
+    def test_inactive_api_key_returns_401(self):
+        key = ApiKey.objects.create(owner="disabled", is_active=False)
+        self.client.credentials(HTTP_X_API_KEY=key.key)
+        self.assertEqual(self._post().status_code, 401)
+
+    # --- rate limit ------------------------------------------------------- #
+    @patch("rag_engine.views.get_rag_service")
+    def test_rate_limit_returns_429_after_threshold(self, mock_get_service):
+        key = ApiKey.objects.create(owner="load-test", requests_per_minute=3)
+        self.client.credentials(HTTP_X_API_KEY=key.key)
+
+        codes = []
+        for _ in range(5):
+            _fake_stream_service(mock_get_service)  # fresh iterator each call
+            resp = self._post()
+            if hasattr(resp, "streaming_content"):
+                b"".join(resp.streaming_content)
+            codes.append(resp.status_code)
+
+        self.assertEqual(codes[:3], [200, 200, 200])
+        self.assertEqual(codes[3], 429)
+        self.assertEqual(codes[4], 429)
+
+    # --- audit log ------------------------------------------------------- #
+    @patch("rag_engine.views.get_rag_service")
+    def test_valid_request_logged_in_audit_and_metrics_joinable(self, mock_get_service):
+        _fake_stream_service(mock_get_service)
+        key = ApiKey.objects.create(owner="acme")
+        self.client.credentials(HTTP_X_API_KEY=key.key)
+
+        resp = self._post()
+        b"".join(resp.streaming_content)
+
+        self.assertEqual(resp.status_code, 200)
+        request_id = resp["X-Request-ID"]
+
+        audit = RequestAuditLog.objects.get()
+        metric = RequestMetric.objects.get()
+        self.assertEqual(audit.status_code, 200)
+        self.assertEqual(audit.endpoint, self.url)
+        self.assertEqual(audit.api_key_id, key.id)
+        self.assertEqual(audit.api_key_owner, "acme")
+        # the join key: audit.request_id == metric.request_id == X-Request-ID
+        self.assertEqual(str(audit.request_id), request_id)
+        self.assertEqual(audit.request_id, metric.request_id)
+        # and it joins at the ORM level
+        self.assertEqual(
+            RequestAuditLog.objects.filter(request_id=metric.request_id).count(), 1
+        )
+
+    def test_401_is_audited_with_no_request_id(self):
+        self.client.credentials(HTTP_X_API_KEY="ncg_bogus")
+        self._post()
+        audit = RequestAuditLog.objects.get()
+        self.assertEqual(audit.status_code, 401)
+        self.assertIsNone(audit.request_id)
+        self.assertIsNone(audit.api_key_id)
+        self.assertEqual(audit.api_key_hint, "ncg_bogus"[:12])
+        self.assertEqual(RequestMetric.objects.count(), 0)

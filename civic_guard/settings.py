@@ -72,7 +72,18 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'whitenoise.middleware.WhiteNoiseMiddleware',
+    # Gateway audit log - last, so it sees the final status of every /api/
+    # request (including the 401/429 that never reach the view).
+    'rag_engine.middleware.AuditLogMiddleware',
 ]
+
+# --- DRF gateway (API-key auth + per-key rate limit) ---
+REST_FRAMEWORK = {
+    "DEFAULT_THROTTLE_RATES": {
+        # Default for any ApiKey without its own requests_per_minute.
+        "api_key": os.getenv("API_KEY_DEFAULT_RATE", "60/min"),
+    },
+}
 
 ROOT_URLCONF = 'civic_guard.urls'
 

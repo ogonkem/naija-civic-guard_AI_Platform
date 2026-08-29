@@ -1,6 +1,26 @@
 from django.contrib import admin
 
-from .models import EvalResult, RequestMetric
+from .models import ApiKey, EvalResult, RequestAuditLog, RequestMetric
+
+
+@admin.register(ApiKey)
+class ApiKeyAdmin(admin.ModelAdmin):
+    list_display = ("owner", "key", "is_active", "requests_per_minute", "created_at")
+    list_filter = ("is_active", "created_at")
+    search_fields = ("owner", "key")
+    readonly_fields = ("key", "created_at")
+
+
+@admin.register(RequestAuditLog)
+class RequestAuditLogAdmin(admin.ModelAdmin):
+    list_display = ("timestamp", "method", "endpoint", "status_code",
+                    "api_key_owner", "api_key_hint", "request_id")
+    list_filter = ("status_code", "method", "endpoint", "timestamp")
+    search_fields = ("api_key_owner", "api_key_hint")
+    date_hierarchy = "timestamp"
+
+    def get_readonly_fields(self, request, obj=None):
+        return [f.name for f in self.model._meta.fields]
 
 
 @admin.register(RequestMetric)

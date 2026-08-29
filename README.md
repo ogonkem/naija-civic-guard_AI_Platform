@@ -57,6 +57,28 @@ they arrive.
 (`RagEngineConfig.ready()`) so the first request doesn't pay the model-load cost.
 Set `RAG_WARMUP=0` to skip the warm-up during fast dev restarts.
 
+#### Gateway (DRF) — API key + rate limit + audit log
+
+`POST /api/chat/` sits behind a DRF gateway (all in `rag_engine/`):
+
+* **Auth** — `ApiKeyAuthentication` (custom `BaseAuthentication`) checks the
+  `X-API-Key` header against the `ApiKey` model (`key`, `owner`, `is_active`,
+  `requests_per_minute`, `created_at`). Missing / unknown / inactive key →
+  **401**. Create keys with `python manage.py create_api_key --owner "<name>" [--rpm N]`
+  or in the Django admin — never by hand.
+* **Rate limit** — `ApiKeyRateThrottle` (DRF `SimpleRateThrottle`) keyed on the
+  API key, not a Django user. Default `api_key` rate is `60/min`
+  (`API_KEY_DEFAULT_RATE`); an `ApiKey.requests_per_minute` overrides it for
+  that key. Over the limit → **429**. (Throttle state is in Django's default
+  LocMemCache — per-process; use a shared cache for multi-worker gunicorn.)
+* **Audit log** — `AuditLogMiddleware` (plain Django middleware, last in the
+  chain) writes one `RequestAuditLog` row per `/api/` request via the ORM:
+  `api_key`, `api_key_owner`, `endpoint`, `method`, `status_code`, `timestamp`,
+  and `request_id`. The `request_id` is the `X-Request-ID` response header
+  `ChatView` sets from its `RequestMetrics`, so **audit log and metrics join on
+  `request_id`**. 401/429 never reach the agent → those rows have a null
+  `request_id` and no `RequestMetric`. Inspect via the admin or SQL.
+
 ### 4. Request metrics — `rag_engine/metrics.py` + `RequestMetric` model
 
 Every `POST /api/chat/` builds a `RequestMetrics` dataclass at the start of the
@@ -147,7 +169,7 @@ From the most recent `retrieval_eval.py` run recorded in `eval_report.md`:
 | Layer | Choice |
 |---|---|
 | Web framework | Django 6.x (Python 3.12) |
-| API | Django REST Framework — streaming NDJSON endpoint |
+| API | Django REST Framework — streaming NDJSON endpoint, behind an API-key + rate-limit + audit-log gateway |
 | Orchestration | LangChain + **LangGraph** (retrieval agent) |
 | LLM | Groq API (`ChatGroq`); Ollama supported as a commented alternative |
 | Embeddings | `sentence-transformers/all-MiniLM-L6-v2` (local, CPU) |
@@ -213,9 +235,17 @@ From the most recent `retrieval_eval.py` run recorded in `eval_report.md`:
 4. **Run:**
    ```
    python manage.py migrate
+   python manage.py create_api_key --owner "me"      # gateway needs a key
    python manage.py runserver
    ```
-   Then open <http://127.0.0.1:8000/>.
+   Call the API with the key:
+   ```
+   curl -N -X POST localhost:8000/api/chat/ \
+     -H "X-API-Key: <key>" -H "Content-Type: application/json" \
+     -d '{"query":"What does Section 33 say?"}'
+   ```
+   (The browser chat page at `/` posts to the same endpoint and now needs the
+   key wired into `static/js/chat.js` — it will 401 as-is.)
 
 5. **Async evaluation worker** (optional — the app runs fine without it, you
    just get no `eval_results` rows):
