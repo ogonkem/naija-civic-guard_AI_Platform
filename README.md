@@ -190,6 +190,10 @@ python manage.py test rag_engine        # unit + integration (SQLite, no externa
 python retrieval_eval.py                # offline retrieval quality
 ```
 
+**[TESTING.md](TESTING.md)** — a step-by-step manual walkthrough of the whole
+stack (auth, rate limit, metrics row, async eval, audit log, Prometheus,
+Grafana, provider switch, dbt, MCP).
+
 ## Disclaimer
 
 An AI-powered educational tool. Verify every legal finding against the Official
