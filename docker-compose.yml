@@ -1,51 +1,49 @@
 # Naija Civic Guard - full containerised stack.
 #
+# Every value is read from .env - there are NO inline defaults. Copy
+# .env.example to .env and fill it in before `docker compose up`. A missing
+# required var aborts with a message rather than silently using a default.
+#
 # Ollama and any hosted LLM (Groq/OpenAI) stay OUTSIDE Docker. Containers reach
 # the host's Ollama via host.docker.internal (Docker Desktop provides it).
-#
-#   cp .env.example .env   # fill in GROQ_API_KEY etc.
-#   docker compose up --build
-#
-# First boot: the gateway runs migrations and, with AUTO_INGEST=1, ingests the
-# constitution PDF into the ChromaDB service before serving.
 
 services:
   # --- data stores ---------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: ${POSTGRES_IMAGE:?set POSTGRES_IMAGE in .env}
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-civicguard}
-      POSTGRES_USER: ${POSTGRES_USER:-civicguard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicguard}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # Not published to the host by default (some Windows port ranges are
-    # reserved). Use `docker compose exec postgres psql ...`, or add a mapping.
+    # Not published to the host (some Windows port ranges are reserved).
+    # Use `docker compose exec postgres psql ...`.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-civicguard} -d ${POSTGRES_DB:-civicguard}"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: ${HEALTHCHECK_INTERVAL:?set HEALTHCHECK_INTERVAL in .env}
+      timeout: ${HEALTHCHECK_TIMEOUT:?set HEALTHCHECK_TIMEOUT in .env}
+      retries: ${HEALTHCHECK_RETRIES:?set HEALTHCHECK_RETRIES in .env}
 
   redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:?set REDIS_IMAGE in .env}
     ports:
-      - "${REDIS_HOST_PORT:-6380}:6379"
+      - "${REDIS_HOST_PORT:?set REDIS_HOST_PORT in .env}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+      interval: ${HEALTHCHECK_INTERVAL}
+      timeout: ${HEALTHCHECK_TIMEOUT}
+      retries: ${HEALTHCHECK_RETRIES}
 
   chromadb:
-    image: chromadb/chroma:1.0.15
+    image: ${CHROMA_IMAGE:?set CHROMA_IMAGE in .env}
     environment:
-      IS_PERSISTENT: "TRUE"
-      ANONYMIZED_TELEMETRY: "FALSE"
+      IS_PERSISTENT: ${CHROMA_IS_PERSISTENT:?set CHROMA_IS_PERSISTENT in .env}
+      ANONYMIZED_TELEMETRY: ${CHROMA_ANONYMIZED_TELEMETRY:?set CHROMA_ANONYMIZED_TELEMETRY in .env}
     volumes:
       - chromadata:/data
     ports:
-      - "${CHROMA_HOST_PORT:-8001}:8000"
+      - "${CHROMA_HOST_PORT:?set CHROMA_HOST_PORT in .env}:8000"
 
   # --- app services ------------------------------------------------------
   mcp:
@@ -53,13 +51,14 @@ services:
       context: .
       dockerfile: docker/mcp.Dockerfile
     environment:
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: "8000"
-      MCP_TRANSPORT: streamable-http
-      MCP_HOST: "0.0.0.0"
-      MCP_PORT: "8100"
+      CHROMA_HOST: ${CHROMA_HOST:?set CHROMA_HOST in .env}
+      CHROMA_PORT: ${CHROMA_PORT:?set CHROMA_PORT in .env}
+      MCP_TRANSPORT: ${MCP_TRANSPORT:?set MCP_TRANSPORT in .env}
+      MCP_HOST: ${MCP_BIND_HOST:?set MCP_BIND_HOST in .env}
+      MCP_PORT: ${MCP_PORT:?set MCP_PORT in .env}
+      MCP_LOG_LEVEL: ${MCP_LOG_LEVEL:?set MCP_LOG_LEVEL in .env}
     ports:
-      - "${MCP_HOST_PORT:-8100}:8100"
+      - "${MCP_HOST_PORT:?set MCP_HOST_PORT in .env}:${MCP_PORT}"
     depends_on:
       chromadb:
         condition: service_started
@@ -70,23 +69,14 @@ services:
       dockerfile: docker/gateway.Dockerfile
     env_file: [.env]
     environment:
-      DJANGO_DEBUG: "false"
-      DJANGO_ALLOWED_HOSTS: "localhost,127.0.0.1,gateway"
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-civicguard}
-      POSTGRES_USER: ${POSTGRES_USER:-civicguard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicguard}
-      REDIS_URL: redis://redis:6379/0
-      CHROMA_HOST: chromadb
-      CHROMA_PORT: "8000"
-      MCP_SERVER_URL: http://mcp:8100/mcp
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
-      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
-      OLLAMA_LLM_MODEL: ${OLLAMA_LLM_MODEL:-llama3.2}
-      AUTO_INGEST: "1"
+      POSTGRES_HOST: ${POSTGRES_HOST:?set POSTGRES_HOST in .env}
+      POSTGRES_PORT: ${POSTGRES_PORT:?set POSTGRES_PORT in .env}
+      REDIS_URL: ${REDIS_URL:?set REDIS_URL in .env}
+      CHROMA_HOST: ${CHROMA_HOST}
+      CHROMA_PORT: ${CHROMA_PORT}
+      MCP_SERVER_URL: ${MCP_SERVER_URL:?set MCP_SERVER_URL in .env}
     ports:
-      - "${GATEWAY_HOST_PORT:-8000}:8000"
+      - "${GATEWAY_HOST_PORT:?set GATEWAY_HOST_PORT in .env}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -101,20 +91,24 @@ services:
     build:
       context: .
       dockerfile: docker/gateway.Dockerfile
-    command: celery -A civic_guard worker -Q eval -l info --pool=threads --concurrency=4
+    command:
+      - celery
+      - -A
+      - civic_guard
+      - worker
+      - -Q
+      - ${CELERY_QUEUE:?set CELERY_QUEUE in .env}
+      - -l
+      - ${CELERY_LOGLEVEL:?set CELERY_LOGLEVEL in .env}
+      - --pool=${CELERY_POOL:?set CELERY_POOL in .env}
+      - --concurrency=${CELERY_CONCURRENCY:?set CELERY_CONCURRENCY in .env}
     env_file: [.env]
     environment:
-      DJANGO_DEBUG: "false"
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-civicguard}
-      POSTGRES_USER: ${POSTGRES_USER:-civicguard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicguard}
-      REDIS_URL: redis://redis:6379/0
-      OLLAMA_BASE_URL: http://host.docker.internal:11434
-      WORKER_METRICS_PORT: "9540"
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      REDIS_URL: ${REDIS_URL}
     ports:
-      - "${WORKER_METRICS_HOST_PORT:-9540}:9540"   # Prometheus scrape target
+      - "${WORKER_METRICS_HOST_PORT:?set WORKER_METRICS_HOST_PORT in .env}:${WORKER_METRICS_PORT:?set WORKER_METRICS_PORT in .env}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -131,37 +125,37 @@ services:
       context: .
       dockerfile: docker/dbt.Dockerfile
     environment:
-      POSTGRES_HOST: postgres
-      POSTGRES_PORT: "5432"
-      POSTGRES_DB: ${POSTGRES_DB:-civicguard}
-      POSTGRES_USER: ${POSTGRES_USER:-civicguard}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-civicguard}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     depends_on:
       postgres:
         condition: service_healthy
 
   # --- observability (Prometheus + Grafana) ---------------------------
   prometheus:
-    image: prom/prometheus:v2.54.1
+    image: ${PROMETHEUS_IMAGE:?set PROMETHEUS_IMAGE in .env}
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - promdata:/prometheus
     ports:
-      - "${PROMETHEUS_HOST_PORT:-9090}:9090"
+      - "${PROMETHEUS_HOST_PORT:?set PROMETHEUS_HOST_PORT in .env}:9090"
 
   grafana:
-    image: grafana/grafana:11.2.0
+    image: ${GRAFANA_IMAGE:?set GRAFANA_IMAGE in .env}
     environment:
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
-      GF_USERS_DEFAULT_THEME: "light"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_AUTH_ANONYMOUS_ENABLED: ${GRAFANA_ANONYMOUS_ENABLED:?set GRAFANA_ANONYMOUS_ENABLED in .env}
+      GF_AUTH_ANONYMOUS_ORG_ROLE: ${GRAFANA_ANONYMOUS_ROLE:?set GRAFANA_ANONYMOUS_ROLE in .env}
+      GF_USERS_DEFAULT_THEME: ${GRAFANA_DEFAULT_THEME:?set GRAFANA_DEFAULT_THEME in .env}
     volumes:
       - grafanadata:/var/lib/grafana
       - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports:
-      - "${GRAFANA_HOST_PORT:-3000}:3000"
+      - "${GRAFANA_HOST_PORT:?set GRAFANA_HOST_PORT in .env}:3000"
     depends_on:
       - prometheus
 
