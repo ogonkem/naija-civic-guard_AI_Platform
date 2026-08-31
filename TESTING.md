@@ -190,8 +190,88 @@ or `docker compose exec gateway python manage.py dump_metrics -n 5`.
 ## 5b. The MCP tool server as an independent service
 
 The MCP server is its own container on `:8100`, talking streamable-http — the
-agent connects to it exactly like any other MCP client. List its tools and call
-each one directly:
+agent connects to it exactly like any other MCP client. Two ways to poke it
+directly: raw `curl` (shows the wire protocol, needs no gateway container), or
+the project's own client (shows connection reuse / warm calls).
+
+### Raw HTTP with `curl`
+
+It speaks JSON-RPC 2.0 over Streamable HTTP. Every request needs
+`Accept: application/json, text/event-stream` — the server answers with SSE, so
+each response body is a `data: {json}` line.
+
+**1. Initialize — hands back a session id you reuse on every later call:**
+
+```bash
+MCP=http://localhost:8100/mcp
+
+curl -s -D /tmp/mcp.head -o /dev/null -X POST $MCP \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},
+        "clientInfo":{"name":"curl","version":"1.0"}}}'
+
+SID=$(grep -i '^mcp-session-id:' /tmp/mcp.head | tr -d '\r' | awk '{print $2}')
+echo "session = $SID"
+```
+
+**2. Send the `initialized` notification (required before any tool call):**
+
+```bash
+curl -s -o /dev/null -w "initialized -> %{http_code}\n" -X POST $MCP \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+# expect: 202
+```
+
+**3. A helper that POSTs one JSON-RPC call and unwraps the SSE + nested JSON:**
+
+```bash
+mcp () {
+  curl -s -X POST $MCP \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H "mcp-session-id: $SID" -d "$1" \
+  | sed -n 's/^data: //p' \
+  | python -c "import sys,json; r=json.loads(sys.stdin.read())['result']; print(json.dumps(json.loads(r['content'][0]['text']) if 'content' in r else r, indent=2))"
+}
+```
+
+**4. List the tools, then call each one:**
+
+```bash
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call",
+      "params":{"name":"lookup_section","arguments":{"number":45}}}'
+
+mcp '{"jsonrpc":"2.0","id":4,"method":"tools/call",
+      "params":{"name":"find_related_sections","arguments":{"section_id":"Section 45"}}}'
+
+mcp '{"jsonrpc":"2.0","id":5,"method":"tools/call",
+      "params":{"name":"search_precedent","arguments":{"query":"murder case law"}}}'
+```
+
+Expected:
+- `tools/list` → `lookup_section(number)`, `find_related_sections(section_id)`,
+  `search_precedent(query)`, each with its `inputSchema`.
+- `lookup_section(45)` → `{"section":"Section 45","found":true,"chunks":[...]}` —
+  the text of s.45 straight from Chroma metadata, no embedding.
+- `find_related_sections("Section 45")` →
+  `"references":["Section 37", … "Section 41","Section 33"]` plus the text of the
+  first few.
+- `search_precedent(...)` →
+  `{"implemented":false,"message":"not yet implemented — case law integration planned"}`
+  — the stub, by design (not an error).
+
+Notes: the session is stateful — reuse `$SID` for the whole run; a stale or
+missing `mcp-session-id` gets a `404 Session not found`, just re-run step 1.
+Omitting `text/event-stream` from `Accept` gets a `406`.
+
+### Via the project's MCP client
 
 ```bash
 docker compose exec -T gateway python - <<'PY'
